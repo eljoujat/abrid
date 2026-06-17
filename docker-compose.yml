@@ -6,13 +6,20 @@ services:
   # worker : ingestion GTFS au démarrage puis arrêt
   # ---------------------------------------------------------------------------
   worker:
-    build: .
+    build:
+      context: .
+      args:
+        - HTTP_PROXY=${HTTP_PROXY:-}
+        - HTTPS_PROXY=${HTTPS_PROXY:-}
+        - NO_PROXY=${NO_PROXY:-}
     environment:
       DB_PATH:            /data/oncf.db
       INGEST_ON_STARTUP:  "true"
       WORKER_MODE:        "true"
       GTFS_URL:           ${GTFS_URL:-https://github.com/newsbubbles/rail_maroc_oncf/raw/main/oncf_gtfs.zip}
       RESPECT_FEED_DATES: ${RESPECT_FEED_DATES:-false}
+      # Proxy d'entreprise — à renseigner dans .env si nécessaire
+      JAVA_TOOL_OPTIONS:  ${JAVA_TOOL_OPTIONS:-}
     volumes:
       - data:/data
     restart: "no"

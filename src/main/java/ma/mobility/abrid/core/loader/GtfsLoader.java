@@ -57,8 +57,14 @@ public class GtfsLoader {
     // Téléchargement
     // -------------------------------------------------------------------------
 
-    /** Télécharge le flux GTFS depuis l'URL et retourne le contenu brut du ZIP. */
+    /** Télécharge le flux GTFS depuis l'URL et retourne le contenu brut du ZIP. Supporte file://. */
     public byte[] download(String url) throws IOException, InterruptedException {
+        // Support fichier local (file:// ou chemin absolu)
+        if (url.startsWith("file://")) {
+            var path = java.nio.file.Path.of(URI.create(url));
+            log.info("Lecture GTFS depuis fichier local : {}", path);
+            return java.nio.file.Files.readAllBytes(path);
+        }
         log.info("Téléchargement GTFS depuis {}…", url);
         var client  = HttpClient.newBuilder()
             .followRedirects(HttpClient.Redirect.NORMAL)

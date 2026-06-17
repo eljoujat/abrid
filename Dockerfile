@@ -20,6 +20,20 @@ FROM eclipse-temurin:21-jre-jammy
 
 WORKDIR /app
 
+# Certificat CA d'entreprise (optionnel) :
+# Placer le fichier PEM dans certs/entreprise-ca.crt avant de builder
+COPY certs/ /tmp/certs/
+RUN if ls /tmp/certs/*.crt 1>/dev/null 2>&1; then \
+      for cert in /tmp/certs/*.crt; do \
+        alias=$(basename "$cert" .crt); \
+        keytool -importcert -noprompt \
+          -keystore "$JAVA_HOME/lib/security/cacerts" \
+          -storepass changeit \
+          -alias "$alias" \
+          -file "$cert"; \
+      done; \
+    fi && rm -rf /tmp/certs
+
 # Répertoire de données (volume monté en prod)
 RUN mkdir -p /data
 
