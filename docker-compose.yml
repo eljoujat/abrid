@@ -1,9 +1,35 @@
 version: "3.9"
 
+# ---------------------------------------------------------------------------
+# Lot 1 — Abrid : PostgreSQL + PostGIS, worker d'ingestion, API REST
+# ---------------------------------------------------------------------------
+
 services:
 
   # ---------------------------------------------------------------------------
-  # worker : ingestion GTFS au démarrage puis arrêt
+  # db : PostgreSQL 16 + PostGIS
+  # ---------------------------------------------------------------------------
+  db:
+    image: postgis/postgis:16-3.4
+    restart: unless-stopped
+    environment:
+      POSTGRES_DB:       ${DB_NAME:-abrid}
+      POSTGRES_USER:     ${DB_USER:-abrid}
+      POSTGRES_PASSWORD: ${DB_PASSWORD:-abrid}
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${DB_USER:-abrid} -d ${DB_NAME:-abrid}"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 20s
+    ports:
+      - "${DB_EXPOSED_PORT:-5432}:5432"
+
+  # ---------------------------------------------------------------------------
+  # worker : ingestion GTFS one-shot au démarrage puis arrêt
+  # Partage le volume data avec api (pas nécessaire en PostgreSQL — réseau DB)
   # ---------------------------------------------------------------------------
   worker:
     build:
@@ -13,39 +39,60 @@ services:
         - HTTPS_PROXY=${HTTPS_PROXY:-}
         - NO_PROXY=${NO_PROXY:-}
     environment:
-      DB_PATH:            /data/oncf.db
+      DB_HOST:            db
+      DB_PORT:            5432
+      DB_NAME:            ${DB_NAME:-abrid}
+      DB_USER:            ${DB_USER:-abrid}
+      DB_PASSWORD:        ${DB_PASSWORD:-abrid}
       INGEST_ON_STARTUP:  "true"
       WORKER_MODE:        "true"
       GTFS_URL:           ${GTFS_URL:-https://github.com/newsbubbles/rail_maroc_oncf/raw/main/oncf_gtfs.zip}
       RESPECT_FEED_DATES: ${RESPECT_FEED_DATES:-false}
-      # Proxy d'entreprise — à renseigner dans .env si nécessaire
+      COVERAGE_THRESHOLD: ${COVERAGE_THRESHOLD:-50}
+      HTTP_PROXY:         ${HTTP_PROXY:-}
+      HTTPS_PROXY:        ${HTTPS_PROXY:-}
+      NO_PROXY:           ${NO_PROXY:-}
+      PROXY_USER:         ${PROXY_USER:-}
+      PROXY_PASSWORD:     ${PROXY_PASSWORD:-}
       JAVA_TOOL_OPTIONS:  ${JAVA_TOOL_OPTIONS:-}
     volumes:
-      - data:/data
+      # ZIP GTFS pré-téléchargé monté directement (réseau restreint)
+      - ./data/oncf_gtfs.zip:/app/data/oncf_gtfs.zip:ro
+    depends_on:
+      db:
+        condition: service_healthy
     restart: "no"
 
   # ---------------------------------------------------------------------------
-  # api : serveur REST FastAPI (attend que le worker ait peuplé la base)
+  # api : serveur REST Spring Boot
+  # Attend que le worker ait terminé l'ingestion initiale
   # ---------------------------------------------------------------------------
   api:
     build: .
     ports:
       - "${PORT:-8080}:8080"
     environment:
-      DB_PATH:            /data/oncf.db
+      DB_HOST:            db
+      DB_PORT:            5432
+      DB_NAME:            ${DB_NAME:-abrid}
+      DB_USER:            ${DB_USER:-abrid}
+      DB_PASSWORD:        ${DB_PASSWORD:-abrid}
       RESPECT_FEED_DATES: ${RESPECT_FEED_DATES:-false}
       INGEST_ON_STARTUP:  "false"
-    volumes:
-      - data:/data
+      WORKER_MODE:        "false"
+      JAVA_TOOL_OPTIONS:  ${JAVA_TOOL_OPTIONS:-}
     depends_on:
+      db:
+        condition: service_healthy
       worker:
         condition: service_completed_successfully
     healthcheck:
-      test: ["CMD", "curl", "-sf", "http://localhost:8080/health"]
+      test: ["CMD", "curl", "-sf", "http://localhost:8080/actuator/health"]
       interval: 30s
       timeout: 10s
       retries: 3
-      start_period: 30s
+      start_period: 40s
+    restart: unless-stopped
 
 volumes:
-  data:
+  pgdata:

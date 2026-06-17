@@ -11,16 +11,18 @@ import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
 import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.boot.test.context.SpringBootTest;
+import org.springframework.test.context.ActiveProfiles;
 
 import java.time.LocalDate;
 
 import static org.assertj.core.api.Assertions.*;
 
 /**
- * Tests d'intégration du moteur de recherche — base SQLite en mémoire.
+ * Tests d'intégration du moteur de recherche — base H2 en mémoire (profil test).
  * Date de référence figée : lundi 2 septembre 2024.
  */
 @SpringBootTest
+@ActiveProfiles("test")
 class SearchServiceTest {
 
     static final LocalDate REF_DATE = LocalDate.of(2024, 9, 2);

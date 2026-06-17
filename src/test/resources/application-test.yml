@@ -1,0 +1,36 @@
+# ---------------------------------------------------------------------------
+# application-test.yml — remplace H2 pour tous les tests unitaires (@SpringBootTest)
+# NE PAS utiliser pour les tests d'intégration Testcontainers
+# ---------------------------------------------------------------------------
+
+spring:
+  datasource:
+    # H2 en mémoire, mode PostgreSQL pour compatibilité syntaxique (ON CONFLICT, etc.)
+    url: jdbc:h2:mem:testdb;DB_CLOSE_DELAY=-1;MODE=PostgreSQL;NON_KEYWORDS=VALUE
+    driver-class-name: org.h2.Driver
+    username: sa
+    password:
+    hikari:
+      maximum-pool-size: 1
+
+  flyway:
+    # H2 ne supporte pas PostGIS — on n'applique que les migrations communes
+    locations: classpath:db/migration
+    baseline-on-migrate: false
+
+# Désactiver l'ingestion au démarrage et le worker pendant les tests
+app:
+  ingest-on-startup: false
+  worker-mode: false
+  worker:
+    coverage-threshold: 0
+
+gtfs:
+  respect-feed-dates: false
+
+# Actuator accessible en tests
+management:
+  endpoints:
+    web:
+      exposure:
+        include: health,metrics

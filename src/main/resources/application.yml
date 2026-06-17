@@ -1,0 +1,92 @@
+# ---------------------------------------------------------------------------
+# application.yml — configuration Spring Boot, tous profils
+# ---------------------------------------------------------------------------
+
+spring:
+  threads:
+    virtual:
+      enabled: true
+
+  # ---------------------------------------------------------------------------
+  # Base de données PostgreSQL (production + dev local avec docker-compose)
+  # Surcharge par application-test.yml pour les tests unitaires (H2)
+  # ---------------------------------------------------------------------------
+  datasource:
+    url: jdbc:postgresql://${DB_HOST:localhost}:${DB_PORT:5432}/${DB_NAME:abrid}
+    username: ${DB_USER:abrid}
+    password: ${DB_PASSWORD:abrid}
+    driver-class-name: org.postgresql.Driver
+    hikari:
+      maximum-pool-size: ${DB_POOL_SIZE:10}
+      connection-timeout: 30000
+      idle-timeout: 600000
+      max-lifetime: 1800000
+
+  # ---------------------------------------------------------------------------
+  # Flyway — migrations au démarrage (idempotent)
+  # Deux emplacements : commun + spécifique PostgreSQL (PostGIS)
+  # ---------------------------------------------------------------------------
+  flyway:
+    enabled: true
+    locations: classpath:db/migration,classpath:db/migration/postgresql
+    baseline-on-migrate: false
+    out-of-order: false
+
+# ---------------------------------------------------------------------------
+# Source GTFS
+# ---------------------------------------------------------------------------
+gtfs:
+  source:
+    url: ${GTFS_URL:https://github.com/newsbubbles/rail_maroc_oncf/raw/main/oncf_gtfs.zip}
+  ssl:
+    trust-all: ${GTFS_SSL_TRUST_ALL:false}
+  proxy:
+    url: ${HTTPS_PROXY:${HTTP_PROXY:}}
+    user: ${PROXY_USER:}
+    password: ${PROXY_PASSWORD:}
+  download:
+    connect-timeout: ${GTFS_CONNECT_TIMEOUT:30}
+    read-timeout: ${GTFS_READ_TIMEOUT:120}
+  respect-feed-dates: ${RESPECT_FEED_DATES:false}
+
+# ---------------------------------------------------------------------------
+# Application — ingestion et worker
+# ---------------------------------------------------------------------------
+app:
+  ingest-on-startup: ${INGEST_ON_STARTUP:false}
+  worker-mode: ${WORKER_MODE:false}
+  worker:
+    # Cron d'ingestion périodique (3h du matin par défaut)
+    cron: ${WORKER_CRON:0 0 3 * * *}
+    # Seuil minimum de couverture (%) pour accepter une ingestion
+    coverage-threshold: ${COVERAGE_THRESHOLD:50}
+
+# ---------------------------------------------------------------------------
+# Serveur
+# ---------------------------------------------------------------------------
+server:
+  port: ${PORT:8080}
+
+# ---------------------------------------------------------------------------
+# Actuator : exposer health + metrics + prometheus
+# ---------------------------------------------------------------------------
+management:
+  endpoints:
+    web:
+      exposure:
+        include: health,info,metrics,prometheus
+  endpoint:
+    health:
+      show-details: always
+  metrics:
+    tags:
+      application: abrid
+
+# ---------------------------------------------------------------------------
+# Logging
+# ---------------------------------------------------------------------------
+logging:
+  level:
+    ma.mobility.abrid: INFO
+  pattern:
+    console: "%d{HH:mm:ss} %-5level %logger{36} - %msg%n"

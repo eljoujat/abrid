@@ -10,16 +10,19 @@ import org.springframework.beans.factory.annotation.Value;
 import org.springframework.stereotype.Service;
 import org.springframework.transaction.annotation.Transactional;
 
+import javax.net.ssl.SSLContext;
+import javax.net.ssl.TrustManager;
+import javax.net.ssl.X509TrustManager;
 import java.io.*;
-import java.net.URI;
-import java.net.http.HttpClient;
-import java.net.http.HttpRequest;
-import java.net.http.HttpResponse;
+import java.net.*;
+import java.net.http.*;
 import java.nio.charset.StandardCharsets;
+import java.security.*;
+import java.security.cert.X509Certificate;
+import java.time.Duration;
 import java.time.Instant;
 import java.util.*;
-import java.util.zip.ZipEntry;
-import java.util.zip.ZipInputStream;
+import java.util.zip.*;
 
 /**
  * Loader GTFS — seule couche autorisée à connaître le format GTFS.
@@ -29,6 +32,13 @@ import java.util.zip.ZipInputStream;
  *
  * <p>L'ingestion est <strong>idempotente</strong> : deux appels successifs
  * avec le même ZIP aboutissent au même état (purge complète + réingestion).
+ *
+ * <h2>Porte de couverture (Lot 1)</h2>
+ * <p>L'ingestion est rejetée si la couverture du nouveau flux est inférieure
+ * au seuil configuré ({@code app.worker.coverage-threshold}) ou inférieure
+ * à la couverture actuelle. La validation se fait <strong>avant</strong>
+ * toute modification de la base, garantissant que la base servie n'est
+ * jamais corrompue.
  */
 @Service
 public class GtfsLoader {
@@ -49,6 +59,28 @@ public class GtfsLoader {
     @Value("${gtfs.source.url:" + GTFS_DEV_URL + "}")
     private String defaultSourceUrl;
 
+    @Value("${gtfs.ssl.trust-all:false}")
+    private boolean trustAll;
+
+    @Value("${gtfs.proxy.url:}")
+    private String proxyUrl;
+
+    @Value("${gtfs.proxy.user:${PROXY_USER:}}")
+    private String proxyUser;
+
+    @Value("${gtfs.proxy.password:${PROXY_PASSWORD:}}")
+    private String proxyPassword;
+
+    @Value("${gtfs.download.connect-timeout:30}")
+    private int connectTimeoutSec;
+
+    @Value("${gtfs.download.read-timeout:120}")
+    private int readTimeoutSec;
+
+    /** Seuil minimum de couverture (%) en dessous duquel l'ingestion est rejetée. */
+    @Value("${app.worker.coverage-threshold:50}")
+    private double minCoveragePct;
+
     public GtfsLoader(StoreRepository store) {
         this.store = store;
     }
@@ -57,19 +89,32 @@ public class GtfsLoader {
     // Téléchargement
     // -------------------------------------------------------------------------
 
-    /** Télécharge le flux GTFS depuis l'URL et retourne le contenu brut du ZIP. Supporte file://. */
+    /**
+     * Télécharge le flux GTFS depuis l'URL et retourne le contenu brut du ZIP.
+     * Supporte {@code file://} pour les tests et le développement hors-réseau.
+     */
     public byte[] download(String url) throws IOException, InterruptedException {
-        // Support fichier local (file:// ou chemin absolu)
         if (url.startsWith("file://")) {
             var path = java.nio.file.Path.of(URI.create(url));
             log.info("Lecture GTFS depuis fichier local : {}", path);
             return java.nio.file.Files.readAllBytes(path);
         }
         log.info("Téléchargement GTFS depuis {}…", url);
-        var client  = HttpClient.newBuilder()
+        var builder = HttpClient.newBuilder()
             .followRedirects(HttpClient.Redirect.NORMAL)
+            .connectTimeout(Duration.ofSeconds(connectTimeoutSec));
+        configureProxy(builder);
+        if (trustAll) {
+            log.warn("gtfs.ssl.trust-all=true : vérification SSL désactivée (dev only)");
+            builder.sslContext(buildTrustAllSslContext());
+        }
+        var client  = builder.build();
+        var request = HttpRequest.newBuilder(URI.create(url))
+            .GET()
+            .timeout(Duration.ofSeconds(readTimeoutSec))
             .build();
-        var request = HttpRequest.newBuilder(URI.create(url)).GET().build();
+        log.info("Téléchargement GTFS (connect-timeout={}s, read-timeout={}s)…",
+            connectTimeoutSec, readTimeoutSec);
         var response = client.send(request, HttpResponse.BodyHandlers.ofByteArray());
         if (response.statusCode() != 200) {
             throw new IOException("Téléchargement GTFS échoué, HTTP " + response.statusCode());
@@ -84,95 +129,202 @@ public class GtfsLoader {
     }
 
     // -------------------------------------------------------------------------
-    // Ingestion
+    // Ingestion — point d'entrée
     // -------------------------------------------------------------------------
 
     /**
-     * Ingère un flux GTFS dans la base.
+     * Ingère un flux GTFS avec validation de la porte de couverture.
      *
-     * <p>Idempotent : purge toutes les tables avant réingestion.
-     * Transactionnel : en cas d'erreur, la base n'est pas corrompue.
+     * <p>Algorithme :
+     * <ol>
+     *   <li>Parse le ZIP en mémoire (aucune écriture DB)</li>
+     *   <li>Calcule la couverture du nouveau flux <em>en mémoire</em></li>
+     *   <li>Compare avec la couverture actuelle et le seuil configuré</li>
+     *   <li>Si validation OK → transaction atomique : purge + insert + meta</li>
+     *   <li>Si validation KO → {@link InsufficientCoverageException} levée,
+     *       la base n'est PAS modifiée</li>
+     * </ol>
      *
      * @param gtfsZip          Contenu brut du fichier ZIP GTFS.
      * @param sourceUrl        URL source (pour les métadonnées).
      * @param respectFeedDates Si false, ignore les bornes de validité (mode dev).
-     * @return Rapport de couverture.
+     * @return Rapport de couverture de la nouvelle ingestion.
+     * @throws InsufficientCoverageException si la couverture est insuffisante ou en dégradation.
      */
-    @Transactional
     public CoverageReport ingest(byte[] gtfsZip, String sourceUrl, boolean respectFeedDates)
             throws IOException {
 
         log.info("Début ingestion GTFS (source={}, respectFeedDates={})…",
-                sourceUrl, respectFeedDates);
+            sourceUrl, respectFeedDates);
 
-        // Lecture de toutes les entrées du ZIP en mémoire
-        Map<String, List<Map<String, String>>> entries = readZip(gtfsZip);
+        // Phase 1 : parse en mémoire (ne touche pas la DB)
+        ParsedGtfs parsed = readZip(gtfsZip);
 
-        // Purge complète (idempotence)
-        store.purgeAll();
-
-        // Ingestion dans l'ordre (contraintes FK)
-        ingestStops(entries.getOrDefault("stops.txt", List.of()));
-        ingestRoutes(entries.getOrDefault("routes.txt", List.of()));
-        ingestCalendar(entries.getOrDefault("calendar.txt", List.of()));
-        ingestCalendarDates(entries.getOrDefault("calendar_dates.txt", List.of()));
-        ingestTrips(entries.getOrDefault("trips.txt", List.of()));
-        ingestStopTimes(entries.getOrDefault("stop_times.txt", List.of()));
-
-        // Métadonnées
+        // Phase 2 : calcul de couverture AVANT toute modification DB
         String now = Instant.now().toString();
-        store.setMeta("source_url",          sourceUrl);
-        store.setMeta("ingested_at",         now);
-        store.setMeta("respect_feed_dates",  String.valueOf(respectFeedDates));
+        CoverageReport newReport = computeCoverage(parsed, sourceUrl, now);
 
-        // Rapport de couverture
-        var allRoutes      = new HashSet<>(store.getAllRouteIds());
-        var routesWithTrips = new HashSet<>(store.getRouteIdsWithTrips());
-        var routesWithout   = allRoutes.stream()
-                .filter(r -> !routesWithTrips.contains(r))
-                .sorted()
-                .toList();
+        log.info("Couverture calculée : {}% ({}/{} lignes avec horaires)",
+            newReport.coveragePct(), newReport.routesWithTrips(), newReport.totalRoutes());
 
-        var report = new CoverageReport(
-            allRoutes.size(),
-            routesWithTrips.size(),
+        // Phase 3 : porte de couverture (rejette sans modifier la DB si KO)
+        validateCoverageGate(newReport);
+
+        // Phase 4 : persistance atomique (transaction Spring)
+        persistTransactional(parsed, sourceUrl, respectFeedDates, newReport, now);
+
+        log.info("Ingestion terminée.\n{}", newReport);
+        if (!newReport.routesWithoutTrips().isEmpty()) {
+            log.warn("{} ligne(s) sans horaires : {}",
+                newReport.routesWithoutTrips().size(), newReport.routesWithoutTrips());
+        }
+        return newReport;
+    }
+
+    // -------------------------------------------------------------------------
+    // Phase 2 : calcul de couverture en mémoire
+    // -------------------------------------------------------------------------
+
+    private CoverageReport computeCoverage(ParsedGtfs parsed, String sourceUrl, String now) {
+        Set<String> allRouteIds = new HashSet<>();
+        for (var r : parsed.routes()) {
+            String id = r.get("route_id");
+            if (id != null && !id.isBlank()) allRouteIds.add(id);
+        }
+
+        Set<String> routeIdsWithTrips = new HashSet<>();
+        for (var t : parsed.trips()) {
+            String rid = t.get("route_id");
+            if (rid != null && !rid.isBlank()) routeIdsWithTrips.add(rid);
+        }
+
+        List<String> routesWithout = allRouteIds.stream()
+            .filter(id -> !routeIdsWithTrips.contains(id))
+            .sorted()
+            .toList();
+
+        return new CoverageReport(
+            allRouteIds.size(),
+            routeIdsWithTrips.size(),
             routesWithout,
-            store.countTrips(),
-            store.countStopTimes(),
-            store.countStations(),
+            parsed.trips().size(),
+            parsed.stopTimes().size(),
+            parsed.stops().size(),
             sourceUrl,
             now
         );
+    }
 
-        store.setMeta("coverage_pct", String.valueOf(report.coveragePct()));
+    // -------------------------------------------------------------------------
+    // Phase 3 : porte de couverture
+    // -------------------------------------------------------------------------
 
-        log.info("Ingestion terminée.\n{}", report);
+    /**
+     * Valide que le nouveau flux ne dégrade pas la couverture.
+     *
+     * @throws InsufficientCoverageException si la couverture est insuffisante.
+     */
+    private void validateCoverageGate(CoverageReport newReport) {
+        double newCoverage = newReport.coveragePct();
 
-        if (!routesWithout.isEmpty()) {
-            log.warn("{} ligne(s) sans horaires : {}", routesWithout.size(), routesWithout);
+        // Seuil absolu minimum
+        if (newCoverage < minCoveragePct) {
+            String msg = String.format(
+                "Couverture insuffisante : %.1f%% < seuil minimum %.1f%%. Ingestion rejetée.",
+                newCoverage, minCoveragePct);
+            log.error(msg);
+            throw new InsufficientCoverageException(msg);
         }
-        return report;
+
+        // Dégradation par rapport à la couverture actuelle
+        double currentCoverage = store.getMeta("coverage_pct")
+            .map(s -> { try { return Double.parseDouble(s); } catch (Exception e) { return -1.0; } })
+            .orElse(-1.0);
+
+        if (currentCoverage >= 0 && newCoverage < currentCoverage) {
+            String msg = String.format(
+                "Dégradation de couverture détectée : %.1f%% → %.1f%%. Ingestion rejetée.",
+                currentCoverage, newCoverage);
+            log.error(msg);
+            throw new InsufficientCoverageException(msg);
+        }
+
+        if (currentCoverage >= 0) {
+            log.info("Couverture stable/améliorée : {:.1f}% → {:.1f}%",
+                currentCoverage, newCoverage);
+        }
+    }
+
+    // -------------------------------------------------------------------------
+    // Phase 4 : persistance atomique (@Transactional)
+    // -------------------------------------------------------------------------
+
+    /**
+     * Purge et réingère toutes les données dans une transaction atomique.
+     * Si une erreur survient, la transaction est annulée et l'ancienne base est préservée.
+     */
+    @Transactional
+    public void persistTransactional(ParsedGtfs parsed, String sourceUrl,
+                                      boolean respectFeedDates,
+                                      CoverageReport report, String now) {
+        // Purge complète (tables de données seulement, pas ingestion_meta)
+        store.purgeAll();
+
+        // Ingestion dans l'ordre logique
+        ingestStops(parsed.stops());
+        ingestRoutes(parsed.routes());
+        ingestCalendar(parsed.calendar());
+        ingestCalendarDates(parsed.calendarDates());
+        ingestTrips(parsed.trips());
+        ingestStopTimes(parsed.stopTimes());
+
+        // Mise à jour des métadonnées (dans la même transaction)
+        store.setMeta("source_url",         sourceUrl);
+        store.setMeta("ingested_at",        now);
+        store.setMeta("respect_feed_dates", String.valueOf(respectFeedDates));
+        store.setMeta("coverage_pct",       String.valueOf(report.coveragePct()));
+        store.setMeta("total_routes",       String.valueOf(report.totalRoutes()));
+        store.setMeta("routes_with_trips",  String.valueOf(report.routesWithTrips()));
     }
 
     // -------------------------------------------------------------------------
     // Lecture du ZIP
     // -------------------------------------------------------------------------
 
-    private Map<String, List<Map<String, String>>> readZip(byte[] gtfsZip) throws IOException {
-        Map<String, List<Map<String, String>>> result = new HashMap<>();
+    /**
+     * Représentation en mémoire d'un flux GTFS parsé, avant persistance.
+     * Permet de valider la couverture AVANT de toucher la base.
+     */
+    public record ParsedGtfs(
+        List<Map<String, String>> stops,
+        List<Map<String, String>> routes,
+        List<Map<String, String>> trips,
+        List<Map<String, String>> stopTimes,
+        List<Map<String, String>> calendar,
+        List<Map<String, String>> calendarDates
+    ) {}
+
+    ParsedGtfs readZip(byte[] gtfsZip) throws IOException {
+        Map<String, List<Map<String, String>>> entries = new HashMap<>();
         try (var zis = new ZipInputStream(new ByteArrayInputStream(gtfsZip))) {
             ZipEntry entry;
             while ((entry = zis.getNextEntry()) != null) {
                 String name = entry.getName();
                 if (KNOWN_FILES.contains(name)) {
-                    // Lecture de l'entrée complète avant de fermer le parser
                     byte[] data = zis.readAllBytes();
-                    result.put(name, parseCsv(data));
+                    entries.put(name, parseCsv(data));
                 }
                 zis.closeEntry();
             }
         }
-        return result;
+        return new ParsedGtfs(
+            entries.getOrDefault("stops.txt",          List.of()),
+            entries.getOrDefault("routes.txt",         List.of()),
+            entries.getOrDefault("trips.txt",          List.of()),
+            entries.getOrDefault("stop_times.txt",     List.of()),
+            entries.getOrDefault("calendar.txt",       List.of()),
+            entries.getOrDefault("calendar_dates.txt", List.of())
+        );
     }
 
     private List<Map<String, String>> parseCsv(byte[] data) throws IOException {
@@ -194,7 +346,7 @@ public class GtfsLoader {
     }
 
     // -------------------------------------------------------------------------
-    // Ingestion par entité — connaissent le format GTFS, non exposées
+    // Ingestion par entité — connaissent le format GTFS, non exposées hors loader
     // -------------------------------------------------------------------------
 
     private void ingestStops(List<Map<String, String>> stops) {
@@ -204,9 +356,8 @@ public class GtfsLoader {
             Double lat  = parseDouble(row.get("stop_lat"));
             Double lon  = parseDouble(row.get("stop_lon"));
             store.insertStation(id, name, lat, lon, "TRAIN");
-            // Alias normalisé pour résolution insensible aux accents
             String alias = TimeUtils.normalize(name);
-            if (!alias.equals(name.toLowerCase())) {
+            if (!alias.equals(name.toLowerCase(Locale.ROOT))) {
                 store.insertAlias(id, alias);
             }
         }
@@ -297,6 +448,60 @@ public class GtfsLoader {
     private static int parseInt(String value) {
         if (value == null || value.isBlank()) return 0;
         try { return Integer.parseInt(value.trim()); } catch (NumberFormatException e) { return 0; }
+    }
+
+    private void configureProxy(HttpClient.Builder builder) {
+        if (proxyUrl == null || proxyUrl.isBlank()) return;
+        try {
+            var uri  = URI.create(proxyUrl);
+            var host = uri.getHost();
+            var port = uri.getPort() == -1 ? 3128 : uri.getPort();
+            builder.proxy(ProxySelector.of(new InetSocketAddress(host, port)));
+            log.info("Proxy HTTP configuré : {}:{}", host, port);
+
+            String user = proxyUser;
+            String pass = proxyPassword;
+            if (uri.getUserInfo() != null) {
+                String[] parts = uri.getUserInfo().split(":", 2);
+                user = parts[0];
+                pass = parts.length > 1 ? parts[1] : "";
+            }
+
+            if (user != null && !user.isBlank()) {
+                final String finalUser = user;
+                final char[] finalPass = (pass != null ? pass : "").toCharArray();
+                System.setProperty("jdk.http.auth.tunneling.disabledSchemes", "");
+                System.setProperty("jdk.http.auth.proxying.disabledSchemes",  "");
+                builder.authenticator(new Authenticator() {
+                    @Override
+                    protected PasswordAuthentication getPasswordAuthentication() {
+                        if (getRequestorType() == RequestorType.PROXY) {
+                            return new PasswordAuthentication(finalUser, finalPass);
+                        }
+                        return null;
+                    }
+                });
+                log.info("Authentification proxy configurée pour l'utilisateur : {}", finalUser);
+            }
+        } catch (Exception e) {
+            log.warn("gtfs.proxy.url invalide '{}' : {}", proxyUrl, e.getMessage());
+        }
+    }
+
+    private static SSLContext buildTrustAllSslContext() {
+        try {
+            var ctx = SSLContext.getInstance("TLS");
+            ctx.init(null, new TrustManager[]{
+                new X509TrustManager() {
+                    public void checkClientTrusted(X509Certificate[] c, String a) {}
+                    public void checkServerTrusted(X509Certificate[] c, String a) {}
+                    public X509Certificate[] getAcceptedIssuers() { return new X509Certificate[0]; }
+                }
+            }, null);
+            return ctx;
+        } catch (NoSuchAlgorithmException | KeyManagementException e) {
+            throw new IllegalStateException("Impossible de créer le SSLContext trust-all", e);
+        }
     }
 
     @SafeVarargs

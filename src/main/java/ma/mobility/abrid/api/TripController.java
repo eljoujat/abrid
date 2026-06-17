@@ -7,8 +7,11 @@ import ma.mobility.abrid.core.model.Station;
 import ma.mobility.abrid.core.search.SearchService;
 import ma.mobility.abrid.core.store.StoreRepository;
 import ma.mobility.abrid.core.time.TimeUtils;
+import ma.mobility.abrid.realtime.Disruption;
+import ma.mobility.abrid.realtime.DisruptionService;
 import org.springframework.web.bind.annotation.*;
 
+import java.time.Instant;
 import java.time.LocalDate;
 import java.util.Comparator;
 import java.util.List;
@@ -16,30 +19,21 @@ import java.util.Map;
 
 /**
  * Contrôleur REST — aucune logique métier ici.
- * Tout est délégué à SearchService et StoreRepository.
+ * Tout est délégué aux services de la couche search et realtime.
  */
 @RestController
 public class TripController {
 
-    private final SearchService search;
-    private final StoreRepository store;
+    private final SearchService      search;
+    private final StoreRepository    store;
+    private final DisruptionService  disruptionService;
 
-    public TripController(SearchService search, StoreRepository store) {
-        this.search = search;
-        this.store  = store;
-    }
-
-    // -------------------------------------------------------------------------
-    // /health
-    // -------------------------------------------------------------------------
-
-    @GetMapping("/health")
-    public Map<String, Object> health() {
-        return Map.of(
-            "status",       "ok",
-            "lastIngestion", store.getMeta("ingested_at").orElse("jamais"),
-            "coveragePct",   store.getMeta("coverage_pct").map(Double::parseDouble).orElse(0.0)
-        );
+    public TripController(SearchService search,
+                          StoreRepository store,
+                          DisruptionService disruptionService) {
+        this.search           = search;
+        this.store            = store;
+        this.disruptionService = disruptionService;
     }
 
     // -------------------------------------------------------------------------
@@ -56,8 +50,8 @@ public class TripController {
             .map(row -> new StationDto(
                 row.get("id").toString(),
                 row.get("name").toString(),
-                row.get("lat") != null ? Double.parseDouble(row.get("lat").toString()) : null,
-                row.get("lon") != null ? Double.parseDouble(row.get("lon").toString()) : null,
+                row.get("lat")  != null ? Double.parseDouble(row.get("lat").toString())  : null,
+                row.get("lon")  != null ? Double.parseDouble(row.get("lon").toString())  : null,
                 row.get("mode").toString()
             ))
             .toList();
@@ -74,10 +68,9 @@ public class TripController {
             @RequestParam("travel_date")  String travelDate) {
 
         LocalDate date = LocalDate.parse(travelDate);
-
-        var from     = search.resolveStation(fromStation);
-        var to       = search.resolveStation(toStation);
-        var journeys = search.planTrip(fromStation, toStation, date);
+        var from       = search.resolveStation(fromStation);
+        var to         = search.resolveStation(toStation);
+        var journeys   = search.planTrip(fromStation, toStation, date);
 
         return new PlanTripResponse(
             journeys.stream().map(this::toDto).toList(),
@@ -100,16 +93,13 @@ public class TripController {
         var st = search.resolveStation(station);
 
         var departures = store.getStopTimesForStop(st.id()).stream()
-            .filter(row -> {
-                String svcId = row.get("service_id").toString();
-                return isActive(svcId, date);
-            })
+            .filter(row -> isActive(row.get("service_id").toString(), date))
             .map(row -> Map.of(
                 "tripId",    row.get("trip_id").toString(),
                 "routeId",   row.get("route_id").toString(),
                 "headsign",  row.get("headsign").toString(),
                 "departure", TimeUtils.secondsToDisplay(
-                    Integer.parseInt(row.get("departure_seconds").toString()))
+                    toInt(row.get("departure_seconds")))
             ))
             .sorted(Comparator.comparing(m -> m.get("departure")))
             .toList();
@@ -122,16 +112,29 @@ public class TripController {
     }
 
     // -------------------------------------------------------------------------
-    // Convertisseurs domaine → DTO
+    // /disruptions
     // -------------------------------------------------------------------------
 
-    private PlanTripResponse toResponse(
-            List<Journey> journeys, Station from, Station to, String date) {
-        return new PlanTripResponse(
-            journeys.stream().map(this::toDto).toList(),
-            toDto(from), toDto(to), date
-        );
+    /**
+     * Retourne les perturbations actives.
+     *
+     * @param routeId Filtre optionnel par identifiant de ligne.
+     */
+    @GetMapping("/disruptions")
+    public List<DisruptionDto> disruptions(
+            @RequestParam(required = false) String routeId) {
+
+        Instant now = Instant.now();
+        List<Disruption> disruptions = routeId != null && !routeId.isBlank()
+            ? disruptionService.findActiveByRoute(routeId, now)
+            : disruptionService.findActive(now);
+
+        return disruptions.stream().map(this::toDto).toList();
     }
+
+    // -------------------------------------------------------------------------
+    // Convertisseurs domaine → DTO
+    // -------------------------------------------------------------------------
 
     private JourneyDto toDto(Journey j) {
         return new JourneyDto(
@@ -164,16 +167,31 @@ public class TripController {
         return new StationDto(s.id(), s.name(), s.lat(), s.lon(), s.mode().name());
     }
 
+    private DisruptionDto toDto(Disruption d) {
+        return new DisruptionDto(
+            d.id(),
+            d.routeId(),
+            d.stopId(),
+            d.type().name(),
+            d.severity().name(),
+            d.description(),
+            d.startsAt(),
+            d.endsAt(),
+            d.source()
+        );
+    }
+
+    // -------------------------------------------------------------------------
+    // Utilitaires
+    // -------------------------------------------------------------------------
+
     private boolean isActive(String serviceId, LocalDate date) {
-        // Délégation à SearchService via réflexion interne — OK car même package
-        // Pour éviter la duplication, on expose la logique calendrier via SearchService
-        // Cette méthode est minimale pour /schedule
         try {
             var exceptions = store.getCalendarExceptions(serviceId);
             String dateStr = TimeUtils.toGtfsDate(date);
             for (var exc : exceptions) {
                 if (dateStr.equals(exc.get("date").toString())) {
-                    return (int) exc.get("exception_type") == 1;
+                    return toInt(exc.get("exception_type")) == 1;
                 }
             }
             return store.getCalendar(serviceId).map(cal -> {
@@ -183,8 +201,8 @@ public class TripController {
                     intBool(cal, "friday"),    intBool(cal, "saturday"),
                     intBool(cal, "sunday")
                 };
-                String s  = cal.get("start_date") != null ? cal.get("start_date").toString() : "";
-                String e  = cal.get("end_date")   != null ? cal.get("end_date").toString()   : "";
+                String s = cal.get("start_date") != null ? cal.get("start_date").toString() : "";
+                String e = cal.get("end_date")   != null ? cal.get("end_date").toString()   : "";
                 LocalDate start = s.isBlank() ? date : TimeUtils.parseGtfsDate(s);
                 LocalDate end   = e.isBlank() ? date : TimeUtils.parseGtfsDate(e);
                 return TimeUtils.isServiceActive(date, start, end, wd, false);
@@ -194,11 +212,14 @@ public class TripController {
         }
     }
 
+    private static int toInt(Object v) {
+        if (v == null) return 0;
+        if (v instanceof Integer i) return i;
+        if (v instanceof Long l)    return l.intValue();
+        try { return Integer.parseInt(v.toString()); } catch (NumberFormatException e) { return 0; }
+    }
+
     private static boolean intBool(Map<String, Object> row, String key) {
-        Object v = row.get(key);
-        if (v == null) return false;
-        if (v instanceof Integer i) return i != 0;
-        if (v instanceof Long l)    return l != 0;
-        try { return Integer.parseInt(v.toString()) != 0; } catch (NumberFormatException e) { return false; }
+        return toInt(row.get(key)) != 0;
     }
 }

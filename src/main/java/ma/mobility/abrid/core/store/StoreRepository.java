@@ -3,6 +3,7 @@ package ma.mobility.abrid.core.store;
 import org.springframework.jdbc.core.JdbcTemplate;
 import org.springframework.stereotype.Repository;
 
+import java.time.Instant;
 import java.util.List;
 import java.util.Map;
 import java.util.Optional;
@@ -10,7 +11,11 @@ import java.util.Optional;
 /**
  * Accès à la base de données — couche données uniquement.
  * Aucune logique métier ici : déléguer à SearchService.
- * Utilise JdbcTemplate (Core suffit, JPA non nécessaire).
+ *
+ * <p><strong>Stratégie d'upsert :</strong> DELETE + INSERT dans la même transaction.
+ * Compatible PostgreSQL 16 et H2 2.x (sans les contraintes sur EXCLUDED / ON CONFLICT).
+ * Sûr car toutes les opérations d'ingestion sont appelées dans un contexte
+ * {@code @Transactional} après {@link #purgeAll()}.
  */
 @Repository
 public class StoreRepository {
@@ -23,64 +28,70 @@ public class StoreRepository {
 
     // -------------------------------------------------------------------------
     // Métadonnées d'ingestion
+    // Colonnes : meta_key / meta_value  (key et value sont réservés en H2)
     // -------------------------------------------------------------------------
 
     public void setMeta(String key, String value) {
-        jdbc.update(
-            "INSERT OR REPLACE INTO ingestion_meta(key, value) VALUES (?, ?)",
-            key, value
-        );
+        jdbc.update("DELETE FROM ingestion_meta WHERE meta_key = ?", key);
+        jdbc.update("INSERT INTO ingestion_meta(meta_key, meta_value) VALUES (?, ?)", key, value);
     }
 
     public Optional<String> getMeta(String key) {
         var rows = jdbc.queryForList(
-            "SELECT value FROM ingestion_meta WHERE key = ?", key
+            "SELECT meta_value FROM ingestion_meta WHERE meta_key = ?", key
         );
         return rows.isEmpty() ? Optional.empty()
-                : Optional.ofNullable((String) rows.getFirst().get("value"));
+                : Optional.ofNullable((String) rows.getFirst().get("meta_value"));
     }
 
     // -------------------------------------------------------------------------
-    // Purge (idempotence)
+    // Purge (idempotence — ne purge PAS ingestion_meta ni disruptions)
     // -------------------------------------------------------------------------
 
     public void purgeAll() {
+        // Ordre respectant les contraintes logiques (tables feuilles d'abord)
         for (String table : List.of(
-            "stop_times", "calendar_dates", "calendar",
-            "trips", "fares", "station_aliases", "stations", "routes"
+            "stop_times", "calendar_dates", "fares", "calendar",
+            "trips", "station_aliases", "stations", "routes"
         )) {
-            jdbc.execute("DELETE FROM " + table);
+            jdbc.update("DELETE FROM " + table);
         }
     }
 
     // -------------------------------------------------------------------------
-    // Ingestion
+    // Ingestion — gares
+    // (purgeAll() est toujours appelé avant, donc pas de conflit possible)
     // -------------------------------------------------------------------------
 
     public void insertStation(String id, String name, Double lat, Double lon, String mode) {
         jdbc.update(
-            "INSERT OR REPLACE INTO stations(id, name, lat, lon, mode) VALUES (?,?,?,?,?)",
+            "INSERT INTO stations(id, name, lat, lon, mode) VALUES (?,?,?,?,?)",
             id, name, lat, lon, mode
         );
     }
 
     public void insertAlias(String stationId, String alias) {
-        jdbc.update(
-            "INSERT OR IGNORE INTO station_aliases(station_id, alias) VALUES (?,?)",
-            stationId, alias
-        );
+        // INSERT IGNORE / ON CONFLICT DO NOTHING : H2 supporte ON CONFLICT DO NOTHING
+        jdbc.update("""
+            INSERT INTO station_aliases(station_id, alias) VALUES (?,?)
+            ON CONFLICT DO NOTHING
+            """, stationId, alias);
     }
+
+    // -------------------------------------------------------------------------
+    // Ingestion — lignes, services, trajets
+    // -------------------------------------------------------------------------
 
     public void insertRoute(String id, String shortName, String longName, String mode) {
         jdbc.update(
-            "INSERT OR REPLACE INTO routes(id, short_name, long_name, mode) VALUES (?,?,?,?)",
+            "INSERT INTO routes(id, short_name, long_name, mode) VALUES (?,?,?,?)",
             id, shortName, longName, mode
         );
     }
 
     public void insertTrip(String id, String routeId, String serviceId, String headsign) {
         jdbc.update(
-            "INSERT OR REPLACE INTO trips(id, route_id, service_id, headsign) VALUES (?,?,?,?)",
+            "INSERT INTO trips(id, route_id, service_id, headsign) VALUES (?,?,?,?)",
             id, routeId, serviceId, headsign
         );
     }
@@ -89,7 +100,7 @@ public class StoreRepository {
                                int mon, int tue, int wed, int thu, int fri, int sat, int sun,
                                String startDate, String endDate) {
         jdbc.update("""
-            INSERT OR REPLACE INTO calendar
+            INSERT INTO calendar
             (service_id, monday, tuesday, wednesday, thursday, friday, saturday, sunday,
              start_date, end_date)
             VALUES (?,?,?,?,?,?,?,?,?,?)
@@ -98,25 +109,25 @@ public class StoreRepository {
 
     public void insertCalendarDate(String serviceId, String date, int exceptionType) {
         jdbc.update(
-            "INSERT OR REPLACE INTO calendar_dates(service_id, date, exception_type) VALUES (?,?,?)",
+            "INSERT INTO calendar_dates(service_id, date, exception_type) VALUES (?,?,?)",
             serviceId, date, exceptionType
         );
     }
 
     public void insertStopTime(String tripId, String stopId, int seq, int depSec, int arrSec) {
         jdbc.update("""
-            INSERT OR REPLACE INTO stop_times
+            INSERT INTO stop_times
             (trip_id, stop_id, stop_sequence, departure_seconds, arrival_seconds)
             VALUES (?,?,?,?,?)
             """, tripId, stopId, seq, depSec, arrSec);
     }
 
     // -------------------------------------------------------------------------
-    // Lecture gares
+    // Lecture — gares
     // -------------------------------------------------------------------------
 
     public List<Map<String, Object>> getAllStations() {
-        return jdbc.queryForList("SELECT * FROM stations");
+        return jdbc.queryForList("SELECT * FROM stations ORDER BY name");
     }
 
     public List<String> getAliases(String stationId) {
@@ -128,12 +139,11 @@ public class StoreRepository {
     }
 
     // -------------------------------------------------------------------------
-    // Lecture horaires
+    // Lecture — horaires
     // -------------------------------------------------------------------------
 
     /**
      * Retourne les trajets directs de fromStop vers toStop (sens respecté).
-     * Utilise une auto-jointure sur stop_times pour éviter le filtrage en Java.
      */
     public List<Map<String, Object>> findDirectStopTimes(
             String fromStopId, String toStopId, int minDepartureSec) {
@@ -206,5 +216,72 @@ public class StoreRepository {
 
     public List<String> getRouteIdsWithTrips() {
         return jdbc.queryForList("SELECT DISTINCT route_id FROM trips", String.class);
+    }
+
+    // -------------------------------------------------------------------------
+    // Perturbations temps réel
+    // -------------------------------------------------------------------------
+
+    /**
+     * Insère une perturbation et retourne son ID généré.
+     */
+    public long insertDisruption(String routeId, String stopId,
+                                  String type, String severity, String description,
+                                  Instant startsAt, Instant endsAt, String source) {
+        var keyHolder = new org.springframework.jdbc.support.GeneratedKeyHolder();
+        jdbc.update(con -> {
+            var ps = con.prepareStatement("""
+                INSERT INTO disruptions
+                (route_id, stop_id, type, severity, description, starts_at, ends_at, source)
+                VALUES (?,?,?,?,?,?,?,?)
+                """, new String[]{"id"});
+            ps.setString(1, routeId);
+            ps.setString(2, stopId);
+            ps.setString(3, type);
+            ps.setString(4, severity);
+            ps.setString(5, description);
+            ps.setObject(6, startsAt != null ? java.sql.Timestamp.from(startsAt) : null);
+            ps.setObject(7, endsAt   != null ? java.sql.Timestamp.from(endsAt)   : null);
+            ps.setString(8, source);
+            return ps;
+        }, keyHolder);
+        return ((Number) keyHolder.getKeys().get("id")).longValue();
+    }
+
+    /**
+     * Retourne les perturbations actives à l'instant donné.
+     */
+    public List<Map<String, Object>> findActiveDisruptions(Instant now) {
+        var ts = java.sql.Timestamp.from(now);
+        return jdbc.queryForList("""
+            SELECT * FROM disruptions
+            WHERE  (starts_at IS NULL OR starts_at <= ?)
+              AND  (ends_at   IS NULL OR ends_at   >= ?)
+            ORDER  BY severity, starts_at
+            """, ts, ts);
+    }
+
+    /**
+     * Retourne les perturbations actives filtrées par ligne.
+     */
+    public List<Map<String, Object>> findActiveDisruptionsByRoute(String routeId, Instant now) {
+        var ts = java.sql.Timestamp.from(now);
+        return jdbc.queryForList("""
+            SELECT * FROM disruptions
+            WHERE  route_id = ?
+              AND  (starts_at IS NULL OR starts_at <= ?)
+              AND  (ends_at   IS NULL OR ends_at   >= ?)
+            ORDER  BY severity, starts_at
+            """, routeId, ts, ts);
+    }
+
+    /**
+     * Supprime les perturbations expirées (nettoyage périodique).
+     */
+    public int purgeExpiredDisruptions(Instant before) {
+        return jdbc.update(
+            "DELETE FROM disruptions WHERE ends_at IS NOT NULL AND ends_at < ?",
+            java.sql.Timestamp.from(before)
+        );
     }
 }
