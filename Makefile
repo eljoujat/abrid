@@ -4,7 +4,12 @@
 # Installation
 # ---------------------------------------------------------------------------
 install:
-	pip install -e ".[dev]"
+	# Installe le paquet en mode éditable sans re-résoudre les dépendances
+	# (les dépendances sont supposées déjà installées — voir pyproject.toml)
+	pip3 install --break-system-packages -e . --no-deps --no-build-isolation
+	@echo "\n✓ Dépendances requises : fastapi pydantic httpx sqlalchemy alembic"
+	@echo "✓ Dev : pytest pytest-cov ruff mypy"
+	@echo "  → pip3 install --break-system-packages <paquet> si manquant"
 
 # ---------------------------------------------------------------------------
 # Qualité
