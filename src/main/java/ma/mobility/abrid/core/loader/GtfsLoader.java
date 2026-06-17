@@ -60,7 +60,9 @@ public class GtfsLoader {
     /** Télécharge le flux GTFS depuis l'URL et retourne le contenu brut du ZIP. */
     public byte[] download(String url) throws IOException, InterruptedException {
         log.info("Téléchargement GTFS depuis {}…", url);
-        var client  = HttpClient.newHttpClient();
+        var client  = HttpClient.newBuilder()
+            .followRedirects(HttpClient.Redirect.NORMAL)
+            .build();
         var request = HttpRequest.newBuilder(URI.create(url)).GET().build();
         var response = client.send(request, HttpResponse.BodyHandlers.ofByteArray());
         if (response.statusCode() != 200) {
