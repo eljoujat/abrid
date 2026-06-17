@@ -1,27 +1,35 @@
-FROM python:3.11-slim
+# ---------------------------------------------------------------------------
+# Étape 1 — Build Maven
+# ---------------------------------------------------------------------------
+FROM maven:3.9.8-eclipse-temurin-21 AS build
 
 WORKDIR /app
 
-# Dépendances système
-RUN apt-get update && apt-get install -y --no-install-recommends \
-    curl \
-    && rm -rf /var/lib/apt/lists/*
+# Pré-télécharger les dépendances (cache Docker)
+COPY pom.xml .
+RUN mvn dependency:go-offline -q
 
-# Dépendances Python
-COPY pyproject.toml .
-RUN pip install --no-cache-dir -e .
+# Compiler et packager (tests sautés — ils s'exécutent en CI)
+COPY src/ src/
+RUN mvn package -DskipTests -q
 
-# Code source
-COPY oncf_transit/ oncf_transit/
-COPY scripts/ scripts/
+# ---------------------------------------------------------------------------
+# Étape 2 — Image d'exécution légère
+# ---------------------------------------------------------------------------
+FROM eclipse-temurin:21-jre-jammy
 
-# Dossier de données (volume en prod)
-RUN mkdir -p data
+WORKDIR /app
+
+# Répertoire de données (volume monté en prod)
+RUN mkdir -p /data
+
+# Copie du fat-jar depuis l'étape de build
+COPY --from=build /app/target/abrid-*.jar app.jar
 
 # Sonde de santé
-HEALTHCHECK --interval=30s --timeout=10s --start-period=20s --retries=3 \
-    CMD curl -f http://localhost:8000/health || exit 1
+HEALTHCHECK --interval=30s --timeout=10s --start-period=30s --retries=3 \
+    CMD curl -sf http://localhost:8080/health || exit 1
 
-EXPOSE 8000
+EXPOSE 8080
 
-CMD ["uvicorn", "oncf_transit.api.main:app", "--host", "0.0.0.0", "--port", "8000"]
+ENTRYPOINT ["java", "-jar", "app.jar"]

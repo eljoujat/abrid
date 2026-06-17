@@ -3,82 +3,110 @@
 Moteur de planification de trajets couvrant train (ONCF), bus et grands taxis.
 Conçu pour être piloté par un agent IA conversant en darija.
 
+## Stack technique
+
+| Composant | Technologie |
+|---|---|
+| Langage | Java 21 |
+| Framework | Spring Boot 3.3 |
+| Gestionnaire de dépendances | Maven 3.9 |
+| Base de données (dev) | SQLite via JDBC |
+| Base de données (prod, Lot 1) | PostgreSQL 16 + PostGIS |
+| Tests | JUnit 5 + AssertJ + MockMvc |
+| Conteneurisation | Docker (multi-stage) + docker-compose |
+
 ## Démarrage rapide
 
-```bash
-# 1. Installer les dépendances
-make install
+### Avec Maven (dev)
 
-# 2. Ingérer les données (télécharge le flux GTFS communautaire)
+```bash
+# 1. Compiler
+make build
+
+# 2. Ingérer les données GTFS
 make ingest
 
 # 3. Lancer l'API
 make run
-# → http://localhost:8000
-# → http://localhost:8000/docs (Swagger)
+# → http://localhost:8080
+# → http://localhost:8080/health
+```
+
+### Avec Docker (mode conteneur)
+
+```bash
+# Build + ingestion + API en un seul appel
+make docker-up
+
+# Logs
+make docker-logs
+
+# Arrêt
+make docker-down
 ```
 
 ## Commandes disponibles
 
 | Commande | Description |
 |---|---|
-| `make install` | Installe le projet + dépendances dev |
-| `make lint` | Vérification ruff (lint + format) |
-| `make format` | Reformatage automatique |
-| `make type-check` | Vérification mypy (strict sur `core/`) |
-| `make test` | Tests + couverture (seuil 80%) |
-| `make test-real` | Tests contre le vrai flux GTFS (réseau requis) |
-| `make ingest` | Ingestion GTFS depuis l'URL configurée |
-| `make run` | Serveur de développement (rechargement auto) |
-| `make docker-up` | Stack complète via docker-compose |
+| `make install` | Installe + compile (tests sautés) |
+| `make build` | Compile et package le fat-jar |
+| `make test` | Exécute tous les tests |
+| `make run` | Serveur de développement |
+| `make ingest` | Ingestion GTFS en mode worker |
+| `make docker-build` | Build de l'image Docker |
+| `make docker-up` | Stack complète (worker + api) |
+| `make docker-down` | Arrêt de la stack |
+| `make clean` | Nettoyage Maven + base |
 
 ## Architecture
 
 ```
-oncf_transit/
+src/main/java/ma/mobility/abrid/
+├── AbridApplication.java
 ├── core/
-│   ├── models.py        # Domaine multimodal : Station, Leg, Journey
-│   ├── time_utils.py    # Temps en secondes depuis minuit (gère >24:00:00)
-│   ├── store.py         # Accès SQLite (PostgreSQL au Lot 1)
-│   ├── gtfs_loader.py   # Ingestion GTFS + rapport de couverture
-│   └── search.py        # Résolution gare + routage (directs + 1 correspondance)
-├── api/
-│   └── main.py          # FastAPI : /health /stations /plan_trip /schedule
-scripts/
-└── ingest.py            # CLI d'ingestion
-tests/
-├── test_search.py       # Tests unitaires et API (base en mémoire)
-└── test_real_gtfs.py    # Tests contre le vrai flux (opt-in)
+│   ├── model/          # Domaine multimodal : Mode, Station, Leg, Journey
+│   ├── time/           # TimeUtils : secondes depuis minuit, gestion >24:00:00
+│   ├── store/          # SchemaInitializer, StoreRepository (JdbcTemplate)
+│   ├── loader/         # GtfsLoader — seule couche connaissant le format GTFS
+│   └── search/         # SearchService : résolution gare + routage
+├── api/                # TripController, GlobalExceptionHandler, DTOs
+└── ingestion/          # IngestRunner (ApplicationRunner)
 ```
 
 ## Endpoints API
 
-- `GET /health` — santé + fraîcheur des données
-- `GET /stations?q=Tanger` — liste des gares
-- `GET /plan_trip?from_station=Tanger&to_station=Casa&travel_date=2024-09-02` — planification
-- `GET /schedule?station=Tanger&travel_date=2024-09-02` — départs depuis une gare
-
-## Principe fondamental : honnêteté des données
-
-**Jamais de trajet inventé.** Si un OD n'est pas couvert, l'API renvoie HTTP 404
-avec un message explicite. La couverture des lignes est mesurée et exposée
-dans le rapport d'ingestion et via `/health`.
-
-## Lots de travail
-
-- **Lot 0** (courant) : socle industrialisé, CI, tests, SQLite
-- **Lot 1** : PostgreSQL + PostGIS, source maintenue, temps réel
-- **Lot 2** : OpenTripPlanner (routage complet, N correspondances)
-- **Lot 3** : Skill agent + restitution darija
-- **Lot 4** : Bus (CTM/Supratours)
-- **Lot 5** : Grands taxis (crowdsourcing)
+| Endpoint | Description |
+|---|---|
+| `GET /health` | Santé + fraîcheur des données |
+| `GET /stations?q=Tanger` | Liste des gares avec filtre optionnel |
+| `GET /plan_trip?from_station=Tanger&to_station=Casa&travel_date=2024-09-02` | Planification |
+| `GET /schedule?station=Tanger&travel_date=2024-09-02` | Départs depuis une gare |
 
 ## Variables d'environnement
 
 Copier `.env.example` en `.env` :
 
-```
+```bash
 DB_PATH=./data/oncf.db
 GTFS_URL=https://github.com/newsbubbles/rail_maroc_oncf/raw/main/oncf_gtfs.zip
 RESPECT_FEED_DATES=false   # true en prod
+INGEST_ON_STARTUP=false
+WORKER_MODE=false
+PORT=8080
 ```
+
+## Principe fondamental : honnêteté des données
+
+**Jamais de trajet inventé.** Si un OD n'est pas couvert, l'API renvoie HTTP 404
+avec un message explicite (`NoDataException`). La couverture est mesurée et
+exposée via `/health`.
+
+## Lots de travail
+
+- **Lot 0** (livré) : socle Spring Boot, moteur GTFS SQLite, tests, Docker
+- **Lot 1** : PostgreSQL + PostGIS, source maintenue, temps réel
+- **Lot 2** : OpenTripPlanner (N correspondances)
+- **Lot 3** : Skill agent + darija
+- **Lot 4** : Bus (CTM/Supratours)
+- **Lot 5** : Grands taxis (crowdsourcing)

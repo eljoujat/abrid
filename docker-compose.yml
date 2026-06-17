@@ -1,32 +1,44 @@
 version: "3.9"
 
 services:
+
+  # ---------------------------------------------------------------------------
+  # worker : ingestion GTFS au démarrage puis arrêt
+  # ---------------------------------------------------------------------------
+  worker:
+    build: .
+    environment:
+      DB_PATH:            /data/oncf.db
+      INGEST_ON_STARTUP:  "true"
+      WORKER_MODE:        "true"
+      GTFS_URL:           ${GTFS_URL:-https://github.com/newsbubbles/rail_maroc_oncf/raw/main/oncf_gtfs.zip}
+      RESPECT_FEED_DATES: ${RESPECT_FEED_DATES:-false}
+    volumes:
+      - data:/data
+    restart: "no"
+
+  # ---------------------------------------------------------------------------
+  # api : serveur REST FastAPI (attend que le worker ait peuplé la base)
+  # ---------------------------------------------------------------------------
   api:
     build: .
     ports:
-      - "8000:8000"
+      - "${PORT:-8080}:8080"
     environment:
-      - DB_PATH=/data/oncf.db
-      - RESPECT_FEED_DATES=${RESPECT_FEED_DATES:-false}
+      DB_PATH:            /data/oncf.db
+      RESPECT_FEED_DATES: ${RESPECT_FEED_DATES:-false}
+      INGEST_ON_STARTUP:  "false"
     volumes:
       - data:/data
     depends_on:
       worker:
         condition: service_completed_successfully
     healthcheck:
-      test: ["CMD", "curl", "-f", "http://localhost:8000/health"]
+      test: ["CMD", "curl", "-sf", "http://localhost:8080/health"]
       interval: 30s
       timeout: 10s
       retries: 3
-
-  worker:
-    build: .
-    command: python -m scripts.ingest --db /data/oncf.db
-    environment:
-      - GTFS_URL=${GTFS_URL:-https://github.com/newsbubbles/rail_maroc_oncf/raw/main/oncf_gtfs.zip}
-    volumes:
-      - data:/data
-    restart: "no"
+      start_period: 30s
 
 volumes:
   data:
