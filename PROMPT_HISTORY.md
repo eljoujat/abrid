@@ -12,9 +12,9 @@ Met à jour ce fichier à la fin de chaque session de travail.
 | Projet | Abrid — Assistant de mobilité multimodal Maroc |
 | Stack | Java 21, Spring Boot 3.3.2, Maven |
 | Package racine | `ma.mobility.abrid` |
-| Version actuelle | `0.4.0` |
-| Dernier lot validé | **Lot 2** |
-| Prochain lot | **Lot 3** (Skill agent darija) |
+| Version actuelle | `0.5.0` |
+| Dernier lot validé | **Lot 3** |
+| Prochain lot | **Lot 4** (Bus CTM/Supratours) |
 
 ---
 
@@ -305,3 +305,40 @@ Ces assertions doivent toujours passer dans `SearchServiceTest` :
 | Correspondance Tanger→Marrakech | `tangerMarrakechViaCasa` | 1 trajet, 2 legs via Casa-Voyageurs |
 | OD non couvert | `odNonCouvreLeveNoDataException` | `NoDataException` |
 | Couverture 100% | `ingestCoverageFullWhenAllRoutesHaveTrips` | `coveragePct = 100.0` |
+
+---
+
+## Lot 3 — Darija Agent Skill (MCP) ✅ VALIDATED
+
+**Session date**: 2026-06-18
+**Tests**: 75/75 ✅ | ArchUnit 8 rules ✅ | Commit `82424e9`
+
+### Delivered
+
+- **Spring AI 1.0.0** MCP server (`spring-ai-starter-mcp-server-webmvc`) — offline cache
+- **5 tools** in `agent/AgentTools.java`:
+  - `plan_trip` — resolves station names (accent-insensitive, darija-tolerant)
+  - `get_schedule` — departure board for a station
+  - `get_station_info` — station lookup with disambiguation
+  - `get_disruptions` — active disruptions filterable by routeId
+  - `submit_correction` — crowdsourced corrections (Flyway V4)
+- **ArchUnit rule 8**: agent package must not depend on loader
+- **SKILL.md**: Claude Desktop config, darija examples, system prompt template
+- **Data honesty oracle**: `AgentToolsTest.dataHonestyNoInventedJourneys`
+
+### MCP endpoints
+- SSE stream : `GET  http://localhost:8080/sse`
+- Tool calls : `POST http://localhost:8080/mcp/message`
+
+---
+
+## Lot 4 — Bus CTM/Supratours 🔜
+
+**Prerequisites**: validate legal basis for bus data (marKoub.ma partnership vs scraping)
+
+**Technical plan**:
+1. Bus GTFS (partnership or ToS-compliant source)
+2. Ingest into same pipeline (mode=BUS)
+3. OTP combines GTFS train + bus automatically
+4. Bus fares in `fares` table
+5. `get_fare_estimate` tool in AgentTools
