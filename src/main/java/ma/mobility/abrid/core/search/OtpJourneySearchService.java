@@ -16,9 +16,10 @@ import org.springframework.context.annotation.Primary;
 import org.springframework.http.MediaType;
 import org.springframework.stereotype.Service;
 import org.springframework.web.client.RestClient;
-import org.springframework.web.util.UriComponentsBuilder;
 
 import java.time.LocalDate;
+import java.time.LocalTime;
+import java.time.OffsetDateTime;
 import java.time.ZoneId;
 import java.time.ZonedDateTime;
 import java.time.format.DateTimeFormatter;
@@ -29,18 +30,21 @@ import java.util.Map;
 /**
  * Moteur de recherche de trajets via OpenTripPlanner 2.x.
  *
- * <p>Actif uniquement si {@code app.otp.enabled=true} (voir {@code application.yml}).
- * En cas d'échec (OTP down, timeout, réponse invalide), le circuit breaker
- * bascule automatiquement sur le {@link SearchService} SQL.
+ * <p>Actif uniquement si {@code app.otp.enabled=true}.
+ * En cas d'échec, le circuit breaker bascule sur {@link SearchService} SQL.
  *
- * <p>Utilise l'API REST plan d'OTP :
- * {@code GET /otp/routers/default/plan?fromPlace=...&toPlace=...}
+ * <h2>API utilisée</h2>
+ * <p>OTP 2.5+ a supprimé l'ancienne API REST. On utilise l'API GraphQL GTFS :
+ * {@code POST /otp/gtfs/v1}
  *
- * <p>Le mapping OTP → domaine respecte les principes du brief :
- * <ul>
- *   <li>Aucun concept GTFS brut n'est exposé hors de ce package</li>
- *   <li>Si OTP ne trouve rien → {@link NoDataException} (jamais inventer)</li>
- * </ul>
+ * <h2>Résolution de gare</h2>
+ * <p>Sans OSM, OTP ne peut pas router depuis des coordonnées GPS (pas de « nearest stop »).
+ * On utilise donc le format {@code "Nom::feedId:stopId"} pour cibler directement
+ * le stop GTFS dans {@code fromPlace} / {@code toPlace}.
+ *
+ * <h2>Conversion des temps</h2>
+ * <p>OTP 2.6 retourne {@code scheduledTime} en ISO-8601 ({@code 2025-08-30T08:00:00+01:00}).
+ * On convertit en secondes-depuis-minuit du jour de service.
  */
 @Service
 @Primary
@@ -52,10 +56,26 @@ public class OtpJourneySearchService implements JourneySearchPort {
     private static final DateTimeFormatter DATE_FMT = DateTimeFormatter.ISO_LOCAL_DATE;
     private static final DateTimeFormatter TIME_FMT = DateTimeFormatter.ofPattern("HH:mm:ss");
 
-    private final RestClient       otpClient;
-    private final SearchService    sqlFallback;
-    private final StoreRepository  store;
-    private final ObjectMapper     mapper;
+    /** Endpoint GraphQL OTP 2.5+ GTFS */
+    private static final String GQL_PATH = "/otp/gtfs/v1";
+
+    /** Fragment GraphQL réutilisable pour un leg de trajet */
+    private static final String LEG_FRAGMENT = """
+            legs {
+              mode
+              start { scheduledTime }
+              end   { scheduledTime }
+              from  { name stop { gtfsId } lat lon }
+              to    { name stop { gtfsId } lat lon }
+              route { shortName longName gtfsId }
+              trip  { gtfsId }
+            }
+        """;
+
+    private final RestClient      otpClient;
+    private final SearchService   sqlFallback;
+    private final StoreRepository store;
+    private final ObjectMapper    mapper;
 
     @Value("${app.otp.gtfs-feed-id:1}")
     private String feedId;
@@ -74,95 +94,99 @@ public class OtpJourneySearchService implements JourneySearchPort {
     }
 
     // -------------------------------------------------------------------------
-    // JourneySearchPort — point d'entrée principal avec circuit breaker
+    // JourneySearchPort — point d'entrée avec circuit breaker
     // -------------------------------------------------------------------------
 
-    /**
-     * Planifie un trajet via OTP. En cas d'erreur, le circuit breaker appelle
-     * automatiquement {@link #fallbackPlanTrip}.
-     */
     @Override
     @CircuitBreaker(name = "otp", fallbackMethod = "fallbackPlanTrip")
     public List<Journey> planTrip(Station from, Station to, LocalDate date, int minDepSec) {
 
-        if (from.lat() == null || from.lon() == null || to.lat() == null || to.lon() == null) {
-            log.warn("OTP : coordonnées manquantes pour {} ou {}, fallback SQL.", from.name(), to.name());
-            return sqlFallback.planTrip(from, to, date, minDepSec);
-        }
-
         ZoneId tz       = ZoneId.of(timezone);
-        ZonedDateTime midnight = date.atStartOfDay(tz);
-        ZonedDateTime earliest = midnight.plusSeconds(minDepSec);
+        ZonedDateTime earliest = date.atStartOfDay(tz).plusSeconds(minDepSec);
+        String timeStr  = earliest.format(TIME_FMT);
 
-        String url = UriComponentsBuilder.fromPath("/otp/routers/default/plan")
-            .queryParam("fromPlace",      "{fromName}::{fromLat},{fromLon}")
-            .queryParam("toPlace",        "{toName}::{toLat},{toLon}")
-            .queryParam("date",           date.format(DATE_FMT))
-            .queryParam("time",           earliest.format(TIME_FMT))
-            .queryParam("mode",           "RAIL,WALK")
-            .queryParam("numItineraries", 10)
-            .queryParam("arriveBy",       false)
-            .build(Map.of(
-                "fromName", from.name(), "fromLat", from.lat(), "fromLon", from.lon(),
-                "toName",   to.name(),   "toLat",   to.lat(),   "toLon",   to.lon()
-            )).toString();
+        // Format fromPlace : "Nom::feedId:stopId"  (routing direct par stop GTFS, sans OSM)
+        String fromPlace = buildPlace(from);
+        String toPlace   = buildPlace(to);
 
-        log.debug("OTP request : {}", url);
+        String query = buildPlanQuery(fromPlace, toPlace, date.format(DATE_FMT), timeStr, 10);
+        log.debug("OTP GraphQL : from={} to={} date={} time={}", fromPlace, toPlace,
+            date.format(DATE_FMT), timeStr);
 
-        String json = otpClient.get()
-            .uri(url)
-            .accept(MediaType.APPLICATION_JSON)
+        String json = otpClient.post()
+            .uri(GQL_PATH)
+            .contentType(MediaType.APPLICATION_JSON)
+            .body(Map.of("query", query))
             .retrieve()
             .body(String.class);
 
-        List<Journey> journeys = parseOtpResponse(json, date, from, to);
+        List<Journey> journeys = parseOtpResponse(json, date);
 
         if (journeys.isEmpty()) {
             throw new NoDataException(from.name(), to.name(), date.toString());
         }
-        // Filtrer par minDepSec (OTP peut retourner des départs un peu avant)
         return journeys.stream()
             .filter(j -> j.departureSec() >= minDepSec)
             .toList();
     }
 
-    /**
-     * Fallback activé par le circuit breaker (OTP down, timeout, erreur réseau...).
-     */
     @SuppressWarnings("unused")
     private List<Journey> fallbackPlanTrip(Station from, Station to, LocalDate date,
                                             int minDepSec, Throwable cause) {
-        log.warn("OTP indisponible (circuit breaker) — fallback SQL. Cause : {}",
-            cause.getMessage());
+        log.warn("OTP indisponible — fallback SQL. Cause : {}", cause.getMessage());
         return sqlFallback.planTrip(from, to, date, minDepSec);
     }
 
     // -------------------------------------------------------------------------
-    // Mapping réponse OTP → domaine
+    // Construction de la requête GraphQL
     // -------------------------------------------------------------------------
 
+    private static String buildPlanQuery(String fromPlace, String toPlace,
+                                          String date, String time, int numItineraries) {
+        // Échapper les guillemets pour l'insertion dans la query GraphQL
+        return String.format("""
+            {
+              plan(
+                fromPlace: "%s"
+                toPlace:   "%s"
+                date:      "%s"
+                time:      "%s"
+                numItineraries: %d
+              ) {
+                %s
+              }
+            }
+            """, fromPlace, toPlace, date, time, numItineraries, LEG_FRAGMENT);
+    }
+
     /**
-     * Parse la réponse JSON OTP plan API et convertit en liste de {@link Journey}.
-     * Les objets retournés n'exposent aucun concept GTFS brut.
+     * Construit le fromPlace/toPlace OTP au format {@code "Nom::feedId:stopId"}.
+     * Sans OSM, OTP ne peut pas résoudre des coordonnées → on cible le stop directement.
      */
-    List<Journey> parseOtpResponse(String json, LocalDate date, Station from, Station to) {
+    private String buildPlace(Station station) {
+        return station.name() + "::" + feedId + ":" + station.id();
+    }
+
+    // -------------------------------------------------------------------------
+    // Parsing de la réponse
+    // -------------------------------------------------------------------------
+
+    List<Journey> parseOtpResponse(String json, LocalDate date) {
         try {
             JsonNode root = mapper.readTree(json);
-            JsonNode plan = root.path("plan");
+            JsonNode plan = root.path("data").path("plan");
             if (plan.isMissingNode()) {
-                log.warn("OTP : réponse sans nœud 'plan' : {}", json.substring(0, Math.min(200, json.length())));
+                log.warn("OTP : pas de nœud data.plan : {}", json.substring(0, Math.min(300, json.length())));
                 return List.of();
             }
 
-            String sourceUrl    = store.getMeta("source_url").orElse("otp");
-            String freshness    = store.getMeta("ingested_at").orElse("");
-            ZoneId tz           = ZoneId.of(timezone);
-            ZonedDateTime midnight = date.atStartOfDay(tz);
-            long midnightMillis = midnight.toInstant().toEpochMilli();
+            String sourceUrl = store.getMeta("source_url").orElse("otp");
+            String freshness = store.getMeta("ingested_at").orElse("");
+            ZoneId tz        = ZoneId.of(timezone);
 
             List<Journey> journeys = new ArrayList<>();
             for (JsonNode itin : plan.path("itineraries")) {
-                List<Leg> legs = parseLegs(itin.path("legs"), midnightMillis, from, to);
+                List<Leg> legs = parseLegs(itin.path("legs"), date, tz);
                 if (!legs.isEmpty()) {
                     journeys.add(new Journey(legs, sourceUrl, freshness));
                 }
@@ -175,12 +199,11 @@ public class OtpJourneySearchService implements JourneySearchPort {
         }
     }
 
-    private List<Leg> parseLegs(JsonNode legsNode, long midnightMillis,
-                                 Station defaultFrom, Station defaultTo) {
+    private List<Leg> parseLegs(JsonNode legsNode, LocalDate date, ZoneId tz) {
         List<Leg> legs = new ArrayList<>();
-        for (JsonNode legNode : legsNode) {
+        for (JsonNode leg : legsNode) {
             try {
-                legs.add(parseLeg(legNode, midnightMillis, defaultFrom, defaultTo));
+                legs.add(parseLeg(leg, date, tz));
             } catch (Exception e) {
                 log.debug("OTP : leg ignoré : {}", e.getMessage());
             }
@@ -188,76 +211,76 @@ public class OtpJourneySearchService implements JourneySearchPort {
         return legs;
     }
 
-    private Leg parseLeg(JsonNode leg, long midnightMillis,
-                          Station defaultFrom, Station defaultTo) {
-        String otpMode = leg.path("mode").asText("RAIL");
-        Mode mode      = parseMode(otpMode);
+    private Leg parseLeg(JsonNode leg, LocalDate serviceDate, ZoneId tz) {
+        // OTP 2.6 retourne scheduledTime en ISO-8601 : "2025-08-30T08:00:00+01:00"
+        String depIso = leg.path("start").path("scheduledTime").asText();
+        String arrIso = leg.path("end").path("scheduledTime").asText();
 
-        // Temps en secondes depuis minuit du jour de service
-        long startEpoch = leg.path("startTime").asLong();
-        long endEpoch   = leg.path("endTime").asLong();
-        int  depSec     = (int) ((startEpoch - midnightMillis) / 1000L);
-        int  arrSec     = (int) ((endEpoch   - midnightMillis) / 1000L);
+        int depSec = isoToSecsSinceMidnight(depIso, serviceDate, tz);
+        int arrSec = isoToSecsSinceMidnight(arrIso, serviceDate, tz);
 
-        // Gares from/to
         JsonNode fromNode = leg.path("from");
         JsonNode toNode   = leg.path("to");
-        Station  legFrom  = stationFromNode(fromNode, defaultFrom);
-        Station  legTo    = stationFromNode(toNode,   defaultTo);
+        Station  legFrom  = stationFromNode(fromNode);
+        Station  legTo    = stationFromNode(toNode);
 
-        // Route / trip (IDs nettoyés du feedId)
-        String routeId   = stripFeedId(leg.path("routeId").asText(""));
-        String tripId    = stripFeedId(leg.path("tripId").asText(""));
+        String routeId   = stripFeedId(leg.path("route").path("gtfsId").asText(""));
+        String tripId    = stripFeedId(leg.path("trip").path("gtfsId").asText(""));
         String routeName = firstNonBlank(
-            leg.path("routeShortName").asText(""),
-            leg.path("routeLongName").asText(""),
+            leg.path("route").path("shortName").asText(""),
+            leg.path("route").path("longName").asText(""),
             routeId
         );
+        String otpMode = leg.path("mode").asText("RAIL");
 
-        return new Leg(legFrom, legTo, depSec, arrSec, mode, tripId, routeId, routeName, null, null);
+        return new Leg(legFrom, legTo, depSec, arrSec, parseMode(otpMode),
+            tripId, routeId, routeName, null, null);
     }
 
-    private Station stationFromNode(JsonNode node, Station defaultStation) {
+    /**
+     * Convertit une date/heure ISO-8601 en secondes depuis minuit du jour de service.
+     * Gère les horaires passant minuit (valeur > 86400).
+     */
+    static int isoToSecsSinceMidnight(String iso, LocalDate serviceDate, ZoneId tz) {
+        if (iso == null || iso.isBlank()) return 0;
+        OffsetDateTime odt = OffsetDateTime.parse(iso);
+        // Minuit du jour de service dans la timezone locale
+        ZonedDateTime midnight = serviceDate.atStartOfDay(tz);
+        long diffSec = odt.toEpochSecond() - midnight.toEpochSecond();
+        return (int) diffSec;
+    }
+
+    private Station stationFromNode(JsonNode node) {
         String name   = node.path("name").asText("");
         double lat    = node.path("lat").asDouble(0);
         double lon    = node.path("lon").asDouble(0);
-        String stopId = stripFeedId(node.path("stopId").asText(""));
+        String stopId = stripFeedId(node.path("stop").path("gtfsId").asText(""));
 
-        if (name.isBlank()) return defaultStation;
-
-        // Chercher en DB pour avoir les alias et le nom canonique
-        String finalStopId = stopId;
-        String finalName   = name;
-        double finalLat    = lat;
-        double finalLon    = lon;
-        return store.getAllStations().stream()
-            .filter(row -> {
-                Object rowId   = row.get("id");
-                Object rowName = row.get("name");
-                return (rowId   != null && rowId.toString().equals(finalStopId))
-                    || (rowName != null && rowName.toString().equalsIgnoreCase(finalName));
-            })
-            .map(row -> new Station(
-                row.get("id").toString(),
-                row.get("name").toString(),
-                row.get("lat")  != null ? Double.parseDouble(row.get("lat").toString())  : null,
-                row.get("lon")  != null ? Double.parseDouble(row.get("lon").toString())  : null,
-                Mode.TRAIN,
-                List.of()
-            ))
-            .findFirst()
-            .orElse(new Station(
-                finalStopId.isBlank() ? finalName.toUpperCase().replace(" ", "_") : finalStopId,
-                finalName, finalLat, finalLon, Mode.TRAIN, List.of()
-            ));
+        if (!stopId.isBlank()) {
+            // Chercher en DB pour avoir les alias et le nom canonique
+            var found = store.getAllStations().stream()
+                .filter(row -> stopId.equals(row.getOrDefault("id", "").toString()))
+                .findFirst();
+            if (found.isPresent()) {
+                var row = found.get();
+                return new Station(
+                    row.get("id").toString(),
+                    row.get("name").toString(),
+                    row.get("lat") != null ? Double.parseDouble(row.get("lat").toString()) : null,
+                    row.get("lon") != null ? Double.parseDouble(row.get("lon").toString()) : null,
+                    Mode.TRAIN, List.of()
+                );
+            }
+        }
+        String id = stopId.isBlank() ? name.toUpperCase().replace(" ", "_") : stopId;
+        return new Station(id, name, lat, lon, Mode.TRAIN, List.of());
     }
 
     // -------------------------------------------------------------------------
     // Utilitaires
     // -------------------------------------------------------------------------
 
-    /** Supprime le préfixe "feedId:" que OTP ajoute aux IDs GTFS. */
-    private String stripFeedId(String otpId) {
+    String stripFeedId(String otpId) {
         if (otpId == null || otpId.isBlank()) return "";
         int colon = otpId.indexOf(':');
         return colon >= 0 ? otpId.substring(colon + 1) : otpId;
@@ -265,10 +288,10 @@ public class OtpJourneySearchService implements JourneySearchPort {
 
     private static Mode parseMode(String otpMode) {
         return switch (otpMode.toUpperCase()) {
-            case "RAIL", "TRAM", "SUBWAY", "FERRY"  -> Mode.TRAIN;
-            case "BUS", "COACH"                      -> Mode.BUS;
-            case "TAXI", "SHARED_TAXI"               -> Mode.GRAND_TAXI;
-            default                                  -> Mode.TRAIN;
+            case "RAIL", "TRAM", "SUBWAY", "FERRY" -> Mode.TRAIN;
+            case "BUS", "COACH"                     -> Mode.BUS;
+            case "TAXI", "SHARED_TAXI"              -> Mode.GRAND_TAXI;
+            default                                 -> Mode.TRAIN;
         };
     }
 

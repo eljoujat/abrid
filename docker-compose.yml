@@ -72,7 +72,8 @@ services:
       - ./data/otp:/var/opentripplanner
     # --build : construit le graphe depuis le GTFS
     # --serve : démarre l'API REST après build
-    command: ["--build", "--serve", "/var/opentripplanner"]
+    # Le répertoire /var/opentripplanner est le WORKDIR du container OTP 2.x
+    command: ["--build", "--serve"]
     ports:
       - "${OTP_PORT:-8088}:8080"
     environment:
