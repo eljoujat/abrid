@@ -22,11 +22,11 @@ import java.util.*;
  *   <li>Correspondance simple : A→hub→B (hubs principaux)</li>
  * </ol>
  *
- * <p>Ce moteur est le fallback SQL. Il sera remplacé par un client OTP au Lot 2,
- * mais son interface (signatures + objets Journey/Leg) est stable.
+ * <p>Fallback SQL pour {@link JourneySearchPort} : toujours disponible,
+ * utilisé quand OTP est désactivé ou en erreur.
  */
 @Service
-public class SearchService {
+public class SearchService implements JourneySearchPort {
 
     /** Hubs utilisés pour la correspondance simple (remplacé par OTP au Lot 2). */
     private static final List<String> HUB_IDS = List.of(
@@ -187,16 +187,12 @@ public class SearchService {
     }
 
     /**
-     * Point d'entrée principal : planifie un trajet de A vers B.
-     *
-     * @throws StationNotFoundException si A ou B est introuvable.
-     * @throws NoDataException          si aucun trajet n'existe (NE PAS inventer).
+     * Implémentation de {@link JourneySearchPort} — moteur SQL.
+     * Appelé directement si OTP est désactivé, ou en fallback circuit-breaker.
      */
-    public List<Journey> planTrip(String fromQuery, String toQuery, LocalDate date) {
-        var from = resolveStation(fromQuery);
-        var to   = resolveStation(toQuery);
-
-        var journeys = findDirectTrips(from, to, date, 0);
+    @Override
+    public List<Journey> planTrip(Station from, Station to, LocalDate date, int minDepSec) {
+        var journeys = findDirectTrips(from, to, date, minDepSec);
         if (journeys.isEmpty()) {
             journeys = findTripsWithTransfer(from, to, date);
         }
@@ -204,6 +200,19 @@ public class SearchService {
             throw new NoDataException(from.name(), to.name(), date.toString());
         }
         return journeys;
+    }
+
+    /**
+     * Point d'entrée avec résolution de gare par nom (utilisé par le contrôleur
+     * quand OTP est désactivé).
+     *
+     * @throws StationNotFoundException si A ou B est introuvable.
+     * @throws NoDataException          si aucun trajet n'existe (NE PAS inventer).
+     */
+    public List<Journey> planTrip(String fromQuery, String toQuery, LocalDate date) {
+        var from = resolveStation(fromQuery);
+        var to   = resolveStation(toQuery);
+        return planTrip(from, to, date, 0);
     }
 
     // -------------------------------------------------------------------------

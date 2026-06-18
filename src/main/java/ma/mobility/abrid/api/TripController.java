@@ -4,6 +4,7 @@ import ma.mobility.abrid.api.dto.*;
 import ma.mobility.abrid.core.model.Journey;
 import ma.mobility.abrid.core.model.Leg;
 import ma.mobility.abrid.core.model.Station;
+import ma.mobility.abrid.core.search.JourneySearchPort;
 import ma.mobility.abrid.core.search.SearchService;
 import ma.mobility.abrid.core.store.StoreRepository;
 import ma.mobility.abrid.core.time.TimeUtils;
@@ -27,13 +28,16 @@ public class TripController {
     private final SearchService      search;
     private final StoreRepository    store;
     private final DisruptionService  disruptionService;
+    private final JourneySearchPort  journeySearch;
 
     public TripController(SearchService search,
                           StoreRepository store,
-                          DisruptionService disruptionService) {
-        this.search           = search;
-        this.store            = store;
+                          DisruptionService disruptionService,
+                          JourneySearchPort journeySearch) {
+        this.search            = search;
+        this.store             = store;
         this.disruptionService = disruptionService;
+        this.journeySearch     = journeySearch;
     }
 
     // -------------------------------------------------------------------------
@@ -70,7 +74,8 @@ public class TripController {
         LocalDate date = LocalDate.parse(travelDate);
         var from       = search.resolveStation(fromStation);
         var to         = search.resolveStation(toStation);
-        var journeys   = search.planTrip(fromStation, toStation, date);
+        // Routing via OTP (si actif) ou SQL fallback
+        var journeys   = journeySearch.planTrip(from, to, date, 0);
 
         return new PlanTripResponse(
             journeys.stream().map(this::toDto).toList(),

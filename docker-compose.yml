@@ -62,7 +62,30 @@ services:
     restart: "no"
 
   # ---------------------------------------------------------------------------
-  # api : serveur REST Spring Boot
+  # otp : OpenTripPlanner 2.x — routage multimodal (GTFS ONCF)
+  # Build du graphe au 1er démarrage (~2-3 min), puis serve.
+  # ---------------------------------------------------------------------------
+  otp:
+    image: opentripplanner/opentripplanner:2.6.0
+    volumes:
+      # Répertoire OTP : doit contenir le GTFS zip au moment du build
+      - ./data/otp:/var/opentripplanner
+    # --build : construit le graphe depuis le GTFS
+    # --serve : démarre l'API REST après build
+    command: ["--build", "--serve", "/var/opentripplanner"]
+    ports:
+      - "${OTP_PORT:-8088}:8080"
+    environment:
+      JAVA_TOOL_OPTIONS: "-Xmx2g"
+    healthcheck:
+      test: ["CMD", "curl", "-sf", "http://localhost:8080/otp/routers/default"]
+      interval: 30s
+      timeout: 10s
+      retries: 10
+      start_period: 180s  # OTP a besoin de temps pour builder le graphe
+    restart: unless-stopped
+
+  # ---------------------------------------------------------------------------
   # Attend que le worker ait terminé l'ingestion initiale
   # ---------------------------------------------------------------------------
   api:
@@ -78,6 +101,8 @@ services:
       RESPECT_FEED_DATES: ${RESPECT_FEED_DATES:-false}
       INGEST_ON_STARTUP:  "false"
       WORKER_MODE:        "false"
+      OTP_ENABLED:        ${OTP_ENABLED:-false}
+      OTP_URL:            http://otp:8080
       JAVA_TOOL_OPTIONS:  ${JAVA_TOOL_OPTIONS:-}
     depends_on:
       db:

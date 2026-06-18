@@ -60,6 +60,37 @@ app:
     cron: ${WORKER_CRON:0 0 3 * * *}
     # Seuil minimum de couverture (%) pour accepter une ingestion
     coverage-threshold: ${COVERAGE_THRESHOLD:50}
+  # OpenTripPlanner 2.x
+  otp:
+    enabled: ${OTP_ENABLED:false}
+    base-url: ${OTP_URL:http://otp:8080}
+    connect-timeout-ms: ${OTP_CONNECT_TIMEOUT_MS:5000}
+    read-timeout-ms: ${OTP_READ_TIMEOUT_MS:10000}
+    gtfs-feed-id: ${OTP_FEED_ID:1}
+    timezone: ${OTP_TIMEZONE:Africa/Casablanca}
+
+# ---------------------------------------------------------------------------
+# Resilience4j — circuit breaker OTP
+# ---------------------------------------------------------------------------
+resilience4j:
+  circuitbreaker:
+    instances:
+      otp:
+        # Ouvre le circuit après 50% d'échecs sur 5 appels
+        sliding-window-size: 5
+        failure-rate-threshold: 50
+        # Attend 30s avant de retenter (half-open)
+        wait-duration-in-open-state: 30s
+        permitted-number-of-calls-in-half-open-state: 2
+        # Exceptions déclenchant le circuit (toutes sauf NoDataException)
+        record-exceptions:
+          - java.lang.Exception
+        ignore-exceptions:
+          - ma.mobility.abrid.core.search.NoDataException
+  timelimiter:
+    instances:
+      otp:
+        timeout-duration: ${OTP_TIMEOUT_MS:8000}ms
 
 # ---------------------------------------------------------------------------
 # Serveur

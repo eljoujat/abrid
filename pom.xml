@@ -13,7 +13,7 @@
 
   <groupId>ma.mobility</groupId>
   <artifactId>abrid</artifactId>
-  <version>0.3.0</version>
+  <version>0.4.0</version>
   <name>Abrid</name>
   <description>Assistant de mobilité multimodal pour le Maroc — Lot 1 : ONCF production-grade</description>
 
@@ -22,6 +22,7 @@
     <commons-csv.version>1.11.0</commons-csv.version>
     <archunit.version>1.3.0</archunit.version>
     <jacoco.version>0.8.12</jacoco.version>
+    <resilience4j.version>2.2.0</resilience4j.version>
   </properties>
 
   <dependencies>
@@ -44,6 +45,19 @@
     <dependency>
       <groupId>org.springframework.boot</groupId>
       <artifactId>spring-boot-starter-actuator</artifactId>
+    </dependency>
+
+    <!-- AOP (requis par Resilience4j annotations) -->
+    <dependency>
+      <groupId>org.springframework.boot</groupId>
+      <artifactId>spring-boot-starter-aop</artifactId>
+    </dependency>
+
+    <!-- Circuit breaker Resilience4j (OTP fallback) -->
+    <dependency>
+      <groupId>io.github.resilience4j</groupId>
+      <artifactId>resilience4j-spring-boot3</artifactId>
+      <version>${resilience4j.version}</version>
     </dependency>
 
     <!-- Métriques Prometheus (Micrometer) -->
