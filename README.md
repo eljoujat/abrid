@@ -1,112 +1,152 @@
-# Abrid — Assistant de mobilité multimodal pour le Maroc
+# Abrid — Multimodal Mobility Assistant for Morocco
 
-Moteur de planification de trajets couvrant train (ONCF), bus et grands taxis.
-Conçu pour être piloté par un agent IA conversant en darija.
+> **Abrid** ("path" in Amazigh) is a trip planning assistant for Morocco, designed to answer: *"how do I get from A to B?"* — combining **ONCF trains**, **buses**, **grand taxis** and **urban transit**, with responses in darija.
 
-## Stack technique
+## Tech Stack
 
-| Composant | Technologie |
-|---|---|
-| Langage | Java 21 |
-| Framework | Spring Boot 3.3 |
-| Gestionnaire de dépendances | Maven 3.9 |
-| Base de données (dev) | SQLite via JDBC |
-| Base de données (prod, Lot 1) | PostgreSQL 16 + PostGIS |
-| Tests | JUnit 5 + AssertJ + MockMvc |
-| Conteneurisation | Docker (multi-stage) + docker-compose |
+| Component | Technology |
+|-----------|------------|
+| Language | Java 21 LTS |
+| Framework | Spring Boot 3.3.2 |
+| Build tool | Maven 3.9 (wrapper `./mvnw` committed) |
+| Database (prod) | PostgreSQL 16 + PostGIS |
+| Database (tests) | H2 in-memory (PostgreSQL mode) |
+| Migrations | Flyway |
+| Routing engine | OpenTripPlanner 2.6 (optional) |
+| Circuit breaker | Resilience4j |
+| Tests | JUnit 5 + AssertJ + MockMvc + Testcontainers |
+| Architecture guard | ArchUnit |
+| Observability | Spring Actuator + Micrometer + Prometheus |
+| Containerization | Docker + docker-compose |
 
-## Démarrage rapide
+## Quick Start
 
-### Avec Maven (dev)
-
-```bash
-# 1. Compiler
-make build
-
-# 2. Ingérer les données GTFS
-make ingest
-
-# 3. Lancer l'API
-make run
-# → http://localhost:8080
-# → http://localhost:8080/health
-```
-
-### Avec Docker (mode conteneur)
+### Docker Compose (recommended)
 
 ```bash
-# Build + ingestion + API en un seul appel
-make docker-up
+git clone https://github.com/eljoujat/abrid.git && cd abrid
 
-# Logs
-make docker-logs
+# Copy configuration
+cp .env.example .env
+# Edit .env if port 5432 is already in use: DB_EXPOSED_PORT=5433
 
-# Arrêt
-make docker-down
+# Start PostgreSQL + ingest GTFS data
+docker compose up db worker -d
+
+# Start the REST API
+docker compose up api -d
+
+# Check health
+curl http://localhost:8080/actuator/health
 ```
 
-## Commandes disponibles
+### Local development (without Docker)
 
-| Commande | Description |
-|---|---|
-| `make install` | Installe + compile (tests sautés) |
-| `make build` | Compile et package le fat-jar |
-| `make test` | Exécute tous les tests |
-| `make run` | Serveur de développement |
-| `make ingest` | Ingestion GTFS en mode worker |
-| `make docker-build` | Build de l'image Docker |
-| `make docker-up` | Stack complète (worker + api) |
-| `make docker-down` | Arrêt de la stack |
-| `make clean` | Nettoyage Maven + base |
+```bash
+# Start PostgreSQL only
+docker compose up db -d
 
-## Architecture
-
-```
-src/main/java/ma/mobility/abrid/
-├── AbridApplication.java
-├── core/
-│   ├── model/          # Domaine multimodal : Mode, Station, Leg, Journey
-│   ├── time/           # TimeUtils : secondes depuis minuit, gestion >24:00:00
-│   ├── store/          # SchemaInitializer, StoreRepository (JdbcTemplate)
-│   ├── loader/         # GtfsLoader — seule couche connaissant le format GTFS
-│   └── search/         # SearchService : résolution gare + routage
-├── api/                # TripController, GlobalExceptionHandler, DTOs
-└── ingestion/          # IngestRunner (ApplicationRunner)
+# Run Spring Boot
+export DB_HOST=localhost DB_PORT=5433 DB_USER=abrid DB_PASSWORD=abrid DB_NAME=abrid
+export INGEST_ON_STARTUP=true
+./mvnw spring-boot:run
 ```
 
-## Endpoints API
+### Build & test
+
+```bash
+./mvnw test           # Unit tests (H2, ~20s)
+./mvnw verify         # Unit + integration tests (Testcontainers, ~2min, requires Docker)
+```
+
+## API Endpoints
 
 | Endpoint | Description |
-|---|---|
-| `GET /health` | Santé + fraîcheur des données |
-| `GET /stations?q=Tanger` | Liste des gares avec filtre optionnel |
-| `GET /plan_trip?from_station=Tanger&to_station=Casa&travel_date=2024-09-02` | Planification |
-| `GET /schedule?station=Tanger&travel_date=2024-09-02` | Départs depuis une gare |
+|----------|-------------|
+| `GET /actuator/health` | App health + data freshness indicator |
+| `GET /stations?q=tanger` | List stations with optional name filter |
+| `GET /plan_trip?from_station=Tanger-Ville&to_station=Casa-Voyageurs&travel_date=2025-08-30` | Plan a trip |
+| `GET /schedule?station=Rabat-Ville&travel_date=2025-08-30` | Departure board for a station |
+| `GET /disruptions?routeId=AL_BORAQ_TNG_CASA` | Active disruptions |
 
-## Variables d'environnement
+## Package Structure
 
-Copier `.env.example` en `.env` :
+```
+ma.mobility.abrid/
+├── core/
+│   ├── model/      # Domain: Station, Leg, Journey, Mode (immutable records)
+│   ├── time/       # TimeUtils: seconds-since-midnight, handles >24:00:00
+│   ├── store/      # StoreRepository (JdbcTemplate)
+│   ├── loader/     # GtfsLoader — ONLY layer that knows the GTFS format
+│   └── search/     # JourneySearchPort, SearchService (SQL), OtpJourneySearchService
+├── api/            # TripController, GlobalExceptionHandler, DTOs
+├── realtime/       # Disruption, DisruptionService, DisruptionCollector
+├── config/         # OtpConfig, IngestionScheduler, DataFreshnessHealthIndicator
+└── ingestion/      # IngestRunner (startup)
+```
 
-```bash
-DB_PATH=./data/oncf.db
+## Environment Variables
+
+Copy `.env.example` to `.env` and adapt:
+
+```env
+DB_HOST=localhost
+DB_PORT=5432
+DB_EXPOSED_PORT=5433   # change if 5432 is already taken
+DB_USER=abrid
+DB_PASSWORD=abrid      # change in production
+DB_NAME=abrid
+
 GTFS_URL=https://github.com/newsbubbles/rail_maroc_oncf/raw/main/oncf_gtfs.zip
-RESPECT_FEED_DATES=false   # true en prod
-INGEST_ON_STARTUP=false
-WORKER_MODE=false
+RESPECT_FEED_DATES=false   # set to true in production
+COVERAGE_THRESHOLD=50      # minimum coverage % to accept an ingestion
+
+OTP_ENABLED=false          # set to true to activate OpenTripPlanner routing
 PORT=8080
 ```
 
-## Principe fondamental : honnêteté des données
+## Core Principles
 
-**Jamais de trajet inventé.** Si un OD n'est pas couvert, l'API renvoie HTTP 404
-avec un message explicite (`NoDataException`). La couverture est mesurée et
-exposée via `/health`.
+1. **Strictly descending dependencies**: `api → search → persistence → loader`
+2. **Only `loader` knows the source format** (GTFS, scraping, future APIs)
+3. **Multimodal domain model by default**: a `Leg` can be train, bus or taxi
+4. **Data honesty**: never invent a trip or schedule — missing data → explicit HTTP 404
+5. **Idempotent ingestion**: two runs with the same source = identical DB state
+6. **Time in seconds since midnight**: handles overnight services (e.g. `25:20:00`)
 
-## Lots de travail
+These rules are **automatically enforced by ArchUnit** on every build.
 
-- **Lot 0** (livré) : socle Spring Boot, moteur GTFS SQLite, tests, Docker
-- **Lot 1** : PostgreSQL + PostGIS, source maintenue, temps réel
-- **Lot 2** : OpenTripPlanner (N correspondances)
-- **Lot 3** : Skill agent + darija
-- **Lot 4** : Bus (CTM/Supratours)
-- **Lot 5** : Grands taxis (crowdsourcing)
+## Coverage Gate
+
+Every ingestion is validated *in memory before* touching the database:
+
+```
+parse GTFS ZIP → compute coverage → compare vs threshold & current
+                                          ↓ OK           ↓ degraded
+                                   atomic persist    InsufficientCoverageException
+                                   (purge + insert)   (DB unchanged)
+```
+
+## Delivered Lots
+
+| Lot | Description | Status |
+|-----|-------------|--------|
+| **Lot 0** | Spring Boot scaffold, SQL engine, CI, oracles | ✅ Done |
+| **Lot 1** | PostgreSQL/PostGIS, Flyway, coverage gate, disruptions | ✅ Done |
+| **Lot 2** | OpenTripPlanner 2.x, circuit breaker, N transfers | ✅ Done |
+| **Lot 3** | Agent skill + darija (MCP/Spring AI) | 🔜 Next |
+| **Lot 4** | Bus integration (CTM/Supratours) | 🔜 Planned |
+| **Lot 5** | Grand taxis (crowdsourced data) | 🔜 Planned |
+
+## Documentation
+
+Full documentation available on the [GitHub Wiki](https://github.com/eljoujat/abrid/wiki):
+
+- [Quick Start](https://github.com/eljoujat/abrid/wiki/Quick-Start)
+- [API Reference](https://github.com/eljoujat/abrid/wiki/API-Reference)
+- [Architecture](https://github.com/eljoujat/abrid/wiki/Architecture)
+- [Configuration](https://github.com/eljoujat/abrid/wiki/Configuration)
+- [OpenTripPlanner](https://github.com/eljoujat/abrid/wiki/OpenTripPlanner)
+- [ONCF Data](https://github.com/eljoujat/abrid/wiki/ONCF-Data)
+- [Development](https://github.com/eljoujat/abrid/wiki/Development)
+- [Roadmap](https://github.com/eljoujat/abrid/wiki/Roadmap)
