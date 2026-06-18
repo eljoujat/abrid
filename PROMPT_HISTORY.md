@@ -12,9 +12,9 @@ Met à jour ce fichier à la fin de chaque session de travail.
 | Projet | Abrid — Assistant de mobilité multimodal Maroc |
 | Stack | Java 21, Spring Boot 3.3.2, Maven |
 | Package racine | `ma.mobility.abrid` |
-| Version actuelle | `0.3.0` |
-| Dernier lot validé | **Lot 1** |
-| Prochain lot | **Lot 2** (OTP multimodal) |
+| Version actuelle | `0.4.0` |
+| Dernier lot validé | **Lot 2** |
+| Prochain lot | **Lot 3** (Skill agent darija) |
 
 ---
 
@@ -150,7 +150,84 @@ Met à jour ce fichier à la fin de chaque session de travail.
 
 ---
 
-## Lot 2 — Routage multimodal via OpenTripPlanner 🔜
+## Lot 2 — Routage multimodal via OTP ✅ VALIDÉ
+
+**Date de session** : 2026-06-18  
+**Tests** : 56/56 ✅ | ArchUnit ✅ | Commit `e3bd481`
+
+### Ce qui a été fait
+
+#### Interface JourneySearchPort
+- `JourneySearchPort` : interface dans `search`, stable entre controller et moteurs
+- `SearchService` implémente `JourneySearchPort` (SQL, toujours disponible)
+- `planTrip(Station, Station, LocalDate, int)` : signature avec stations déjà résolues
+- `planTrip(String, String, LocalDate)` conservé pour compatibilité (délègue à l'interface)
+
+#### OtpJourneySearchService (`@Primary`, `@ConditionalOnProperty`)
+- Client `RestClient` → `GET /otp/routers/default/plan` (API REST OTP 2.x)
+- Actif uniquement si `app.otp.enabled=true` (défaut `false`)
+- Mapping JSON OTP → `Journey`/`Leg` domaine : aucun concept GTFS brut exposé
+- Conversion epoch millis → secondes-depuis-minuit (gère horaires passant minuit)
+- Strip feedId OTP : `"1:TANGER"` → `"TANGER"`
+- Résolution gare : cherche en DB par stopId/name, sinon crée Station minimale
+- `@CircuitBreaker(name="otp")` Resilience4j : fallback SQL si OTP down/timeout
+- Fallback si coordonnées manquantes (stations sans lat/lon)
+
+#### Circuit Breaker
+- `resilience4j-spring-boot3:2.2.0` (en cache local, offline)
+- Sliding window = 5, failure threshold = 50%, wait = 30s
+- Timeout OTP configurable : `app.otp.read-timeout-ms` (défaut 10s)
+- `NoDataException` ignorée par le circuit (pas un échec OTP, c'est une réponse normale)
+
+#### Config
+- `OtpConfig` : bean `RestClient` avec timeouts (`SimpleClientHttpRequestFactory`)
+- `application.yml` : section `app.otp.*` + `resilience4j.*`
+- `OTP_ENABLED=false` dans docker-compose (activer dans `.env` avec `OTP_ENABLED=true`)
+
+#### docker-compose
+- Service `otp` : `opentripplanner/opentripplanner:2.6.0`
+- Volume `./data/otp/` contenant `oncf_gtfs.zip`
+- Build graph au démarrage (`--build --serve`)
+- Healthcheck sur `/otp/routers/default` avec `start_period=180s`
+- Port exposé : `OTP_PORT` (défaut 8088)
+
+#### Tests
+- `OtpJourneySearchServiceTest` (8 tests) : mapping direct RAIL, minuit, BUS, JSON malformé, feedId strip, coordonnées manquantes
+- `JourneySearchPortTest` (2 tests) : SearchService actif quand OTP off, NoDataException sur DB vide
+
+### Décisions techniques Lot 2
+
+| Décision | Raison |
+|---|---|
+| API REST OTP (pas GraphQL) | Plus stable entre versions OTP 2.x |
+| `app.otp.enabled=false` par défaut | OTP lourd à démarrer, SQL suffisant en dev |
+| `resilience4j-spring-boot3` (pas spring-cloud) | Déjà en cache local, évite le BOM spring-cloud |
+| Timeout au niveau RestClient (pas TimeLimiter) | Synchronous MVC, pas besoin de Reactor |
+| Coordonnées requises pour OTP | OTP routing nécessite lat/lon, fallback SQL si manquant |
+
+### Fichiers créés Lot 2
+- `src/main/java/ma/mobility/abrid/core/search/JourneySearchPort.java`
+- `src/main/java/ma/mobility/abrid/core/search/OtpJourneySearchService.java`
+- `src/main/java/ma/mobility/abrid/config/OtpConfig.java`
+- `src/test/java/ma/mobility/abrid/core/search/OtpJourneySearchServiceTest.java`
+- `src/test/java/ma/mobility/abrid/core/search/JourneySearchPortTest.java`
+- `data/otp/oncf_gtfs.zip` (copie pour OTP)
+
+### Comment activer OTP
+```bash
+# Dans .env :
+OTP_ENABLED=true
+OTP_PORT=8088
+
+# Démarrer (OTP prend ~2-3 min pour builder le graphe)
+docker compose up otp -d
+# Attendre : curl http://localhost:8088/otp/routers/default
+
+# Puis lancer l'API avec OTP activé
+docker compose up api -d
+```
+
+---
 
 ### Pré-requis avant de démarrer
 1. Lot 1 merge et déployé en staging ✓
