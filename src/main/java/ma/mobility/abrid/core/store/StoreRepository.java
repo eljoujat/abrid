@@ -284,4 +284,30 @@ public class StoreRepository {
             java.sql.Timestamp.from(before)
         );
     }
+
+    // -------------------------------------------------------------------------
+    // Corrections (crowdsourcing — Lot 3)
+    // -------------------------------------------------------------------------
+
+    /**
+     * Records a crowd-sourced data correction for later review.
+     *
+     * @param type        Correction type (FARE, ROUTE, STATION, SCHEDULE, OTHER).
+     * @param description Human-readable description of the correction.
+     * @param dataSource  Optional identifier of the affected entity (stop ID, route ID...).
+     * @return The generated correction ID.
+     */
+    public long insertCorrection(String type, String description, String dataSource) {
+        var keyHolder = new org.springframework.jdbc.support.GeneratedKeyHolder();
+        jdbc.update(con -> {
+            var ps = con.prepareStatement(
+                "INSERT INTO corrections(type, description, data_source) VALUES (?,?,?)",
+                new String[]{"id"});
+            ps.setString(1, type);
+            ps.setString(2, description);
+            ps.setString(3, dataSource);
+            return ps;
+        }, keyHolder);
+        return ((Number) keyHolder.getKeys().get("id")).longValue();
+    }
 }

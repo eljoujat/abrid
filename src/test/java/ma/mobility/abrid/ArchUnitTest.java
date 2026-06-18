@@ -110,6 +110,17 @@ class ArchUnitTest {
         .because("Tout ce qui connaît GTFS doit rester dans le package loader (§1.2).");
 
     // -------------------------------------------------------------------------
+    // Rule 7 : agent must not depend on loader
+    // -------------------------------------------------------------------------
+    @ArchTest
+    static final ArchRule agentDoesNotKnowLoader = noClasses()
+        .that().resideInAPackage(BASE + ".agent..")
+        .should().dependOnClassesThat()
+        .resideInAPackage(BASE + ".core.loader..")
+        .because("The agent package sits above api/search but must not bypass "
+            + "the isolation of the loader (§1.2).");
+
+    // -------------------------------------------------------------------------
     // Test JUnit classique : vérification programmatique (double filet)
     // -------------------------------------------------------------------------
 
@@ -124,5 +135,6 @@ class ArchUnitTest {
         realtimeNeConnaîtPasLoader.check(classes);
         domainNaDependancesSortantes.check(classes);
         loaderNeConnaîtPasSearch.check(classes);
+        agentDoesNotKnowLoader.check(classes);
     }
 }

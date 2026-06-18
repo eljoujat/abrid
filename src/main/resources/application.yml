@@ -70,6 +70,24 @@ app:
     timezone: ${OTP_TIMEZONE:Africa/Casablanca}
 
 # ---------------------------------------------------------------------------
+# Spring AI — MCP Server (Lot 3: agent skill)
+# ---------------------------------------------------------------------------
+  ai:
+    mcp:
+      server:
+        name: abrid-mobility-skill
+        version: "0.5.0"
+        instructions: |
+          You are Abrid, a multimodal mobility assistant for Morocco.
+          You help users plan trips using ONCF trains, buses, and grand taxis.
+          You answer in darija when the user speaks darija.
+          You NEVER invent schedules, fares, or trips.
+          When data is missing, you say so clearly.
+        type: SYNC
+        sse-endpoint: /sse
+        sse-message-endpoint: /mcp/message
+
+# ---------------------------------------------------------------------------
 # Resilience4j — circuit breaker OTP
 # ---------------------------------------------------------------------------
 resilience4j:

@@ -1,9 +1,23 @@
 package ma.mobility.abrid.core.search;
 
-/** Levée quand un terme correspond à plusieurs gares (ambiguïté). */
+import java.util.List;
+
+/**
+ * Thrown when a station query matches more than one station.
+ * The agent tool uses {@link #getCandidates()} to ask the user to clarify.
+ */
 public class AmbiguousStationException extends RuntimeException {
-    public AmbiguousStationException(String query, java.util.List<String> names) {
-        super("Terme ambigu '%s' : plusieurs gares correspondent : %s. Précise le nom."
-            .formatted(query, names));
+
+    private final List<String> candidates;
+
+    public AmbiguousStationException(String query, List<String> candidates) {
+        super("Ambiguous station name '" + query + "': " + candidates
+            + ". Please specify which one.");
+        this.candidates = List.copyOf(candidates);
+    }
+
+    /** Station names that matched the query. */
+    public List<String> getCandidates() {
+        return candidates;
     }
 }
